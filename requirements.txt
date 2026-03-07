@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+yfinance
+pandas_ta
+google-generativeai
+upstash-redis
+pytz
+requests
