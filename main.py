@@ -15,11 +15,14 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
 CRON_SECRET = os.environ.get("CRON_SECRET")
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+
 TIMEZONE = "Asia/Kuala_Lumpur"
 WATCHLIST = ["^GSPC", "CL=F", "GC=F", "NVDA", "AAPL", "^VIX", "BTC-USD"]
 
 app = FastAPI()
-redis = Redis.from_env() 
+redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN) 
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.5-flash")
 
