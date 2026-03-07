@@ -1,7 +1,5 @@
 fastapi
 uvicorn
-yfinance
-google-generativeai
+requests
 upstash-redis
 pytz
-requests
