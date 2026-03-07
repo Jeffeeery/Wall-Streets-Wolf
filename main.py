@@ -2,7 +2,6 @@ import os
 import json
 import pandas as pd
 import yfinance as yf
-import pandas_ta as ta
 from datetime import datetime
 import pytz
 import google.generativeai as genai
@@ -34,23 +33,42 @@ class QuantDataEngine:
         for sym in symbols:
             try:
                 df = data[sym].dropna() if len(symbols) > 1 else data.dropna()
-                df.ta.atr(length=14, append=True)
-                df.ta.rsi(length=14, append=True)
-                df.ta.sma(length=200, append=True)
-                latest = df.iloc[-1]
-                prev = df.iloc[-2]
-                pct_change = ((latest['Close'] - prev['Close']) / prev['Close']) * 100
+                
+                close_prices = df['Close']
+                high_prices = df['High']
+                low_prices = df['Low']
+                
+                # 1. 手写 SMA 200 (200日简单移动平均)
+                sma_200 = close_prices.rolling(window=200).mean().iloc[-1]
+                
+                # 2. 手写 RSI 14 (相对强弱指数，Wilder平滑法)
+                delta = close_prices.diff()
+                gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+                loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+                rsi_14 = (100 - (100 / (1 + gain / loss))).iloc[-1]
+                
+                # 3. 手写 ATR 14 (真实波动幅度)
+                tr1 = high_prices - low_prices
+                tr2 = (high_prices - close_prices.shift()).abs()
+                tr3 = (low_prices - close_prices.shift()).abs()
+                tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                atr_14 = tr.rolling(window=14).mean().iloc[-1]
+                
+                latest_close = close_prices.iloc[-1]
+                prev_close = close_prices.iloc[-2]
+                pct_change = ((latest_close - prev_close) / prev_close) * 100
+                
                 market_state[sym] = {
-                    "price": round(latest['Close'], 2),
-                    "pct_change": round(pct_change, 2),
-                    "RSI_14": round(latest['RSI_14'], 2),
-                    "ATR_14": round(latest['ATRr_14'], 2),
-                    "above_MA200": bool(latest['Close'] > latest['SMA_200'])
+                    "price": round(float(latest_close), 2),
+                    "pct_change": round(float(pct_change), 2),
+                    "RSI_14": round(float(rsi_14), 2),
+                    "ATR_14": round(float(atr_14), 2),
+                    "above_MA200": bool(latest_close > sma_200)
                 }
             except Exception as e:
-                pass
+                print(f"数据处理跳过 {sym}: {e}")
+                
         return json.dumps(market_state, indent=2)
-
 class MarcusAgent:
     @staticmethod
     def execute_and_send():
