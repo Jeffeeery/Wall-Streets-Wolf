@@ -1,15 +1,14 @@
 import os
 import json
-import pandas as pd
-import yfinance as yf
+import requests
 from datetime import datetime
 import pytz
-import google.generativeai as genai
-import requests
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from upstash_redis import Redis
 
-# 初始化环境变量与核心组件
+# ==========================================
+# 1. 显式声明环境变量
+# ==========================================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
@@ -22,89 +21,101 @@ WATCHLIST = ["^GSPC", "CL=F", "GC=F", "NVDA", "AAPL", "^VIX", "BTC-USD"]
 
 app = FastAPI()
 redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN) 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.5-flash")
+
+# ==========================================
+# 2. 原生 Python 手写量化算法 (避开 Pandas)
+# ==========================================
+def calculate_rsi(prices, period=14):
+    if len(prices) < period + 1: return 50.0
+    gains = [max(0, prices[i] - prices[i-1]) for i in range(1, period+1)]
+    losses = [max(0, prices[i-1] - prices[i]) for i in range(1, period+1)]
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    for i in range(period+1, len(prices)):
+        gain = max(0, prices[i] - prices[i-1])
+        loss = max(0, prices[i-1] - prices[i])
+        avg_gain = (avg_gain * 13 + gain) / 14
+        avg_loss = (avg_loss * 13 + loss) / 14
+    if avg_loss == 0: return 100.0
+    return 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
 
 class QuantDataEngine:
     @staticmethod
     def fetch_and_calculate(symbols: list) -> str:
-        data = yf.download(symbols, period="1y", interval="1d", group_by='ticker', progress=False)
         market_state = {}
+        # 伪装 User-Agent 直接调用 Yahoo 底层 API
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        
         for sym in symbols:
             try:
-                df = data[sym].dropna() if len(symbols) > 1 else data.dropna()
+                url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}?range=250d&interval=1d"
+                res = requests.get(url, headers=headers).json()
                 
-                close_prices = df['Close']
-                high_prices = df['High']
-                low_prices = df['Low']
+                # 提取收盘价并过滤空值
+                result = res['chart']['result'][0]
+                closes = [c for c in result['indicators']['quote'][0]['close'] if c is not None]
                 
-                # 1. 手写 SMA 200 (200日简单移动平均)
-                sma_200 = close_prices.rolling(window=200).mean().iloc[-1]
-                
-                # 2. 手写 RSI 14 (相对强弱指数，Wilder平滑法)
-                delta = close_prices.diff()
-                gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-                loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-                rsi_14 = (100 - (100 / (1 + gain / loss))).iloc[-1]
-                
-                # 3. 手写 ATR 14 (真实波动幅度)
-                tr1 = high_prices - low_prices
-                tr2 = (high_prices - close_prices.shift()).abs()
-                tr3 = (low_prices - close_prices.shift()).abs()
-                tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-                atr_14 = tr.rolling(window=14).mean().iloc[-1]
-                
-                latest_close = close_prices.iloc[-1]
-                prev_close = close_prices.iloc[-2]
-                pct_change = ((latest_close - prev_close) / prev_close) * 100
-                
-                market_state[sym] = {
-                    "price": round(float(latest_close), 2),
-                    "pct_change": round(float(pct_change), 2),
-                    "RSI_14": round(float(rsi_14), 2),
-                    "ATR_14": round(float(atr_14), 2),
-                    "above_MA200": bool(latest_close > sma_200)
-                }
+                if len(closes) >= 2:
+                    latest = closes[-1]
+                    prev = closes[-2]
+                    pct_change = ((latest - prev) / prev) * 100
+                    sma200 = sum(closes[-200:]) / min(200, len(closes))
+                    rsi_14 = calculate_rsi(closes)
+                    
+                    market_state[sym] = {
+                        "price": round(latest, 2),
+                        "pct_change": round(pct_change, 2),
+                        "RSI_14": round(rsi_14, 2),
+                        "above_MA200": bool(latest > sma200)
+                    }
             except Exception as e:
                 print(f"数据处理跳过 {sym}: {e}")
                 
         return json.dumps(market_state, indent=2)
+
+# ==========================================
+# 3. 剥离官方 SDK，直接用 HTTP 裸连 Gemini 大脑
+# ==========================================
 class MarcusAgent:
     @staticmethod
     def execute_and_send():
-        # 1. 抓取数据
         current_data = QuantDataEngine.fetch_and_calculate(WATCHLIST)
         
-        # 2. 读取 Upstash 记忆
         last_data = redis.get("marcus_memory")
         last_mem = json.loads(last_data) if last_data else None
         history_context = f"【上期研判回顾】: {last_mem['report']}" if last_mem else "无历史记录。"
         
-        # 3. 构造系统提示词
         prompt = f"""
         你是华尔街量化分析师。
-        【纪律】：事实与推测严格隔离。客观数据为事实，地缘推演为推测。结论先行。
+        【纪律】：事实与推测严格隔离。客观数据为事实，地缘推演为推测。结论先行。保持中性冷酷。
         【输入数据】：{current_data}
         【历史记忆】：{history_context}
         请使用 Telegram Markdown 输出简报：包含 🎯核心结论, 📊盘面事实, 🌍宏观推测, ⚖️纠偏。
         """
         
-        # 4. AI 推演
-        response = model.generate_content(prompt)
-        report = response.text
+        # 抛弃 google-generativeai，直接调用底层 REST API
+        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = {"contents": [{"parts":[{"text": prompt}]}]}
+        gemini_res = requests.post(gemini_url, json=payload, headers={'Content-Type': 'application/json'}).json()
         
-        # 5. 更新 Upstash 记忆
+        # 提取 AI 回复
+        report = gemini_res['candidates'][0]['content']['parts'][0]['text']
+        
+        # 更新 Upstash 记忆
         tz = pytz.timezone(TIMEZONE)
         now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
         redis.set("marcus_memory", json.dumps({"time": now, "report": report[:600]}))
         
-        # 6. 发送 Telegram
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": report, "parse_mode": "Markdown", "disable_web_page_preview": True})
+        # 发送 Telegram
+        tg_url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        requests.post(tg_url, json={"chat_id": TG_CHAT_ID, "text": report, "parse_mode": "Markdown", "disable_web_page_preview": True})
 
+# ==========================================
+# 4. API 路由
+# ==========================================
 @app.get("/")
 def health_check():
-    return {"status": "Marcus Wolf Engine Online"}
+    return {"status": "Marcus Wolf Engine Zero-Fat Edition Online"}
 
 @app.get("/api/trigger-analysis")
 def trigger_analysis(background_tasks: BackgroundTasks, secret: str = ""):
