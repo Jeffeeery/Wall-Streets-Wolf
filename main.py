@@ -3,130 +3,353 @@ import json
 import requests
 from datetime import datetime
 import pytz
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, HTTPException
 from upstash_redis import Redis
 
 # ==========================================
-# 1. 显式声明环境变量
+# 1. 环境变量
 # ==========================================
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-TG_TOKEN = os.environ.get("TG_TOKEN")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID")
-CRON_SECRET = os.environ.get("CRON_SECRET")
-UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
-UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY")
+TG_TOKEN        = os.environ.get("TG_TOKEN")
+TG_CHAT_ID      = os.environ.get("TG_CHAT_ID")
+CRON_SECRET     = os.environ.get("CRON_SECRET")
+UPSTASH_URL     = os.environ.get("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN   = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 
-TIMEZONE = "Asia/Kuala_Lumpur"
+TIMEZONE  = "Asia/Kuala_Lumpur"
 WATCHLIST = ["^GSPC", "CL=F", "GC=F", "NVDA", "AAPL", "^VIX", "BTC-USD"]
 
-app = FastAPI()
-redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN) 
+# 模型名称统一管理，方便未来切换
+GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+
+app   = FastAPI()
+redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
 
 # ==========================================
-# 2. 原生 Python 手写量化算法 (避开 Pandas)
+# 2. 量化指标计算
 # ==========================================
-def calculate_rsi(prices, period=14):
-    if len(prices) < period + 1: return 50.0
-    gains = [max(0, prices[i] - prices[i-1]) for i in range(1, period+1)]
-    losses = [max(0, prices[i-1] - prices[i]) for i in range(1, period+1)]
+def calculate_rsi(prices: list[float], period: int = 14) -> float:
+    """Wilder 平滑 RSI，数据不足时返回中性值 50。"""
+    if len(prices) < period + 1:
+        return 50.0
+
+    # 初始化：用前 period 根 K 线的简单均值
+    gains  = [max(0.0, prices[i] - prices[i - 1]) for i in range(1, period + 1)]
+    losses = [max(0.0, prices[i - 1] - prices[i]) for i in range(1, period + 1)]
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
-    for i in range(period+1, len(prices)):
-        gain = max(0, prices[i] - prices[i-1])
-        loss = max(0, prices[i-1] - prices[i])
-        avg_gain = (avg_gain * 13 + gain) / 14
-        avg_loss = (avg_loss * 13 + loss) / 14
-    if avg_loss == 0: return 100.0
-    return 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
 
+    # Wilder 平滑（EMA 变体）
+    for i in range(period + 1, len(prices)):
+        delta    = prices[i] - prices[i - 1]
+        avg_gain = (avg_gain * (period - 1) + max(0.0, delta))  / period
+        avg_loss = (avg_loss * (period - 1) + max(0.0, -delta)) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100.0 - (100.0 / (1.0 + rs)), 2)
+
+
+def detect_ma_trend(closes: list[float], fast: int = 20, slow: int = 50) -> str:
+    """
+    用快慢双均线判断趋势方向。
+    返回: UP / DOWN / FLAT
+    """
+    if len(closes) < slow:
+        return "FLAT"
+    ma_fast = sum(closes[-fast:]) / fast
+    ma_slow = sum(closes[-slow:]) / slow
+    diff_pct = (ma_fast - ma_slow) / ma_slow * 100
+    if diff_pct > 0.3:
+        return "UP"
+    elif diff_pct < -0.3:
+        return "DOWN"
+    return "FLAT"
+
+
+def calculate_atr(highs, lows, closes, period: int = 14) -> float:
+    """平均真实波幅（ATR），衡量近期波动率。"""
+    if len(closes) < period + 1:
+        return 0.0
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i]  - closes[i - 1]),
+        )
+        trs.append(tr)
+    # 只用最近 period 根
+    recent = trs[-period:]
+    return round(sum(recent) / len(recent), 4)
+
+
+# ==========================================
+# 3. 数据引擎：拉取 + 计算
+# ==========================================
 class QuantDataEngine:
+    HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+    REQUEST_TIMEOUT = 10  # 秒
+
     @staticmethod
-    def fetch_and_calculate(symbols: list) -> str:
-        market_state = {}
-        # 伪装 User-Agent 直接调用 Yahoo 底层 API
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        
+    def fetch_and_calculate(symbols: list[str]) -> dict:
+        market_state: dict[str, dict] = {}
+
         for sym in symbols:
             try:
-                url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}?range=250d&interval=1d"
-                res = requests.get(url, headers=headers).json()
-                
-                # 提取收盘价并过滤空值
-                result = res['chart']['result'][0]
-                closes = [c for c in result['indicators']['quote'][0]['close'] if c is not None]
-                
-                if len(closes) >= 2:
-                    latest = closes[-1]
-                    prev = closes[-2]
-                    pct_change = ((latest - prev) / prev) * 100
-                    sma200 = sum(closes[-200:]) / min(200, len(closes))
-                    rsi_14 = calculate_rsi(closes)
-                    
-                    market_state[sym] = {
-                        "price": round(latest, 2),
-                        "pct_change": round(pct_change, 2),
-                        "RSI_14": round(rsi_14, 2),
-                        "above_MA200": bool(latest > sma200)
-                    }
+                url = (
+                    f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}"
+                    f"?range=250d&interval=1d"
+                )
+                res = requests.get(
+                    url,
+                    headers=QuantDataEngine.HEADERS,
+                    timeout=QuantDataEngine.REQUEST_TIMEOUT,
+                ).json()
+
+                result = res["chart"]["result"][0]
+                quote  = result["indicators"]["quote"][0]
+
+                # ── 清洗数据：过滤 None ──────────────────────────────
+                # zip 三列，只保留全部有值的行
+                raw_rows = zip(
+                    quote.get("close",  []),
+                    quote.get("high",   []),
+                    quote.get("low",    []),
+                    quote.get("volume", []),
+                )
+                clean = [
+                    (c, h, l, v)
+                    for c, h, l, v in raw_rows
+                    if None not in (c, h, l, v)
+                ]
+                if len(clean) < 2:
+                    continue
+
+                closes  = [r[0] for r in clean]
+                highs   = [r[1] for r in clean]
+                lows    = [r[2] for r in clean]
+                volumes = [r[3] for r in clean]
+
+                latest, prev = closes[-1], closes[-2]
+                pct_change   = (latest - prev) / prev * 100
+
+                sma200    = sum(closes[-200:]) / min(200, len(closes))
+                sma50     = sum(closes[-50:])  / min(50,  len(closes))
+                rsi_14    = calculate_rsi(closes)
+                ma_trend  = detect_ma_trend(closes)
+                atr_14    = calculate_atr(highs, lows, closes)
+
+                # 量比：今日成交量 / 近 20 日均量
+                avg_vol20 = sum(volumes[-20:]) / min(20, len(volumes))
+                vol_ratio = round(volumes[-1] / avg_vol20, 2) if avg_vol20 else 1.0
+
+                market_state[sym] = {
+                    "price":       round(latest, 2),
+                    "pct_change":  round(pct_change, 2),
+                    "RSI_14":      rsi_14,
+                    "above_MA200": latest > sma200,
+                    "above_MA50":  latest > sma50,
+                    "ma_trend":    ma_trend,       # UP / DOWN / FLAT
+                    "vol_ratio":   vol_ratio,       # >1.5 = 放量
+                    "ATR_14":      atr_14,
+                }
+
             except Exception as e:
-                print(f"数据处理跳过 {sym}: {e}")
-                
-        return json.dumps(market_state, indent=2)
+                print(f"[QuantDataEngine] 跳过 {sym}: {e}")
+                market_state[sym] = {"error": str(e)}
+
+        return market_state
+
 
 # ==========================================
-# 3. 剥离官方 SDK，直接用 HTTP 裸连 Gemini 大脑
+# 4. Marcus Agent：分析 + 发送
 # ==========================================
 class MarcusAgent:
+
+    # ── Prompt 模板 ────────────────────────────────────────────────
+    SYSTEM_PROMPT = """你是 Marcus Wolf，一名冷静、精确的量化宏观分析师。
+
+## 铁律（违反则输出无效）
+1. 📌 事实 = 来自输入数据的客观数值，严禁加工或夸大
+2. 🔮 推测 = 基于逻辑的延伸判断，必须在句末标注「[推测]」
+3. 结论先行，细节后补；禁止模糊表述（如「或将」「可能」不加标注直接使用）
+4. 输出纯 Telegram MarkdownV2 格式，总长度 ≤ 650 字
+5. 数字保留原始精度，不得四舍五入到整数"""
+
+    USER_PROMPT_TEMPLATE = """## 字段说明
+price=现价 | pct_change=日涨跌幅% | RSI_14=14日RSI | above_MA200/MA50=是否站上均线
+ma_trend=均线方向[UP/DOWN/FLAT] | vol_ratio=量比(>1.5为放量) | ATR_14=日均波幅
+
+## 本期市场快照
+```
+{current_data}
+```
+
+## 历史记忆（上期分析摘要）
+{history_context}
+
+## 输出任务
+严格按以下模板生成 Telegram 简报，不得增删模块：
+
+---
+🎯 *核心结论*
+[1\\-2句，最重要的本期判断，直接可操作]
+
+📊 *盘面事实*
+[仅列客观数据，每条标注来源字段；与上期数据对比（如有历史记忆）]
+
+🌍 *宏观推测* `[推测区]`
+[每条结尾标注置信度：高/中/低；格式：现象 → 原因推断 → 潜在影响 \\[推测\\]]
+
+⚖️ *纠偏 & 上期复盘*
+上期预判：[摘要上期结论，无则填"首次运行"]
+本期验证：[命中 ✅ / 偏差 ❌ / 无法验证 ⚠️]
+最大不确定因子：[1条]
+
+⚡ *操作参考*（信号不明确时输出"信号不足，观望"）
+[关注品种 | 方向 | 触发条件]
+---"""
+
+    # ── 核心执行 ───────────────────────────────────────────────────
     @staticmethod
-    def execute_and_send():
-        current_data = QuantDataEngine.fetch_and_calculate(WATCHLIST)
-        
+    def execute_and_send() -> str:
+        # 1. 拉取量化数据
+        current_data_dict = QuantDataEngine.fetch_and_calculate(WATCHLIST)
+        current_data_json = json.dumps(current_data_dict, indent=2, ensure_ascii=False)
+
+        # 2. 读取历史记忆
         last_data = redis.get("marcus_memory")
-        last_mem = json.loads(last_data) if last_data else None
-        history_context = f"【上期研判回顾】: {last_mem['report']}" if last_mem else "无历史记录。"
-        
-        prompt = f"""
-        你是华尔街量化分析师。
-        【纪律】：事实与推测严格隔离。客观数据为事实，地缘推演为推测。结论先行。保持中性冷酷。
-        【输入数据】：{current_data}
-        【历史记忆】：{history_context}
-        请使用 Telegram Markdown 输出简报：包含 🎯核心结论, 📊盘面事实, 🌍宏观推测, ⚖️纠偏。
-        """
-        
-        # 抛弃 google-generativeai，直接调用底层 REST API
-        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={GEMINI_API_KEY}"
-        payload = {"contents": [{"parts":[{"text": prompt}]}]}
-        gemini_res = requests.post(gemini_url, json=payload, headers={'Content-Type': 'application/json'}).json()
-        
-        # 提取 AI 回复
-        report = gemini_res['candidates'][0]['content']['parts'][0]['text']
-        
-        # 更新 Upstash 记忆
-        tz = pytz.timezone(TIMEZONE)
+        last_mem  = json.loads(last_data) if last_data else None
+        if last_mem:
+            history_context = (
+                f"时间：{last_mem.get('time', 'N/A')}\n"
+                f"结论：{last_mem.get('conclusion', 'N/A')}\n"
+                f"摘要：{last_mem.get('report', 'N/A')}"
+            )
+        else:
+            history_context = "无历史记录（首次运行）。"
+
+        # 3. 构造 Prompt
+        user_prompt = MarcusAgent.USER_PROMPT_TEMPLATE.format(
+            current_data=current_data_json,
+            history_context=history_context,
+        )
+
+        # 4. 调用 Gemini（system + user 分离）
+        gemini_url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        )
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": MarcusAgent.SYSTEM_PROMPT}]
+            },
+            "contents": [
+                {"role": "user", "parts": [{"text": user_prompt}]}
+            ],
+            "generationConfig": {
+                "temperature":     0.3,   # 低温 = 更稳定、更少幻觉
+                "maxOutputTokens": 1024,
+            },
+        }
+
+        try:
+            gemini_res = requests.post(
+                gemini_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            ).json()
+            report = gemini_res["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError, requests.RequestException) as e:
+            report = (
+                f"⚠️ *Marcus Wolf 分析引擎异常*\n"
+                f"错误：`{str(e)[:200]}`\n"
+                f"原始响应片段：`{str(gemini_res)[:300]}`"
+            )
+
+        # 5. 更新结构化记忆（存核心结论 + 快照）
+        tz  = pytz.timezone(TIMEZONE)
         now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
-        redis.set("marcus_memory", json.dumps({"time": now, "report": report[:600]}))
-        
-        # 发送 Telegram
+
+        # 提取第一行非空内容作为"结论"缓存
+        conclusion = next(
+            (line.strip() for line in report.splitlines() if line.strip()),
+            report[:80]
+        )
+        price_snapshot = {
+            sym: data.get("price")
+            for sym, data in current_data_dict.items()
+            if isinstance(data, dict) and "price" in data
+        }
+        redis.set("marcus_memory", json.dumps({
+            "time":       now,
+            "conclusion": conclusion[:120],
+            "report":     report[:600],
+            "snapshot":   price_snapshot,
+        }, ensure_ascii=False))
+
+        # 6. 发送 Telegram（启用 MarkdownV2）
         tg_url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        requests.post(tg_url, json={"chat_id": TG_CHAT_ID, "text": report, "disable_web_page_preview": True})
+        tg_res = requests.post(
+            tg_url,
+            json={
+                "chat_id":                  TG_CHAT_ID,
+                "text":                     report,
+                "parse_mode":               "MarkdownV2",   # ← 修复渲染
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        ).json()
+
+        # Telegram 发送失败时 fallback 纯文本
+        if not tg_res.get("ok"):
+            requests.post(
+                tg_url,
+                json={
+                    "chat_id":                  TG_CHAT_ID,
+                    "text":                     report,
+                    "disable_web_page_preview": True,
+                },
+                timeout=10,
+            )
+
+        return f"报告已发送 | {now} | 资产覆盖: {list(current_data_dict.keys())}"
+
 
 # ==========================================
-# 4. API 路由 (强制前台同步版本)
+# 5. API 路由
 # ==========================================
 @app.get("/")
 def health_check():
-    return {"status": "Marcus Wolf Engine Zero-Fat Edition Online"}
+    return {
+        "status":  "Marcus Wolf Online",
+        "model":   GEMINI_MODEL,
+        "version": "2.0",
+    }
+
 
 @app.get("/api/trigger-analysis")
 def trigger_analysis(secret: str = ""):
     if secret != CRON_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    
+
     try:
-        # 抛弃后台任务，强行前台同步执行！
-        # 此时 Vercel 必须等这行代码彻底跑完（发完 TG 消息），才会返回结果。
         result_msg = MarcusAgent.execute_and_send()
         return {"status": "Success", "detail": result_msg}
     except Exception as e:
-        # 如果崩溃，真凶会直接暴露在屏幕上
-        return {"status": "Failed", "error": str(e)}
+        # 暴露完整错误链，便于调试
+        import traceback
+        return {
+            "status": "Failed",
+            "error":  str(e),
+            "trace":  traceback.format_exc()[-800:],
+        }
