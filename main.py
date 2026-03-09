@@ -94,7 +94,7 @@ class MarcusAgent:
         """
         
         # 抛弃 google-generativeai，直接调用底层 REST API
-        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={GEMINI_API_KEY}"
         payload = {"contents": [{"parts":[{"text": prompt}]}]}
         gemini_res = requests.post(gemini_url, json=payload, headers={'Content-Type': 'application/json'}).json()
         
