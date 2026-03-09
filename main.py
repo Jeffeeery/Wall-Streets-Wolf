@@ -111,15 +111,22 @@ class MarcusAgent:
         requests.post(tg_url, json={"chat_id": TG_CHAT_ID, "text": report, "parse_mode": "Markdown", "disable_web_page_preview": True})
 
 # ==========================================
-# 4. API 路由
+# 4. API 路由 (强制前台同步版本)
 # ==========================================
 @app.get("/")
 def health_check():
     return {"status": "Marcus Wolf Engine Zero-Fat Edition Online"}
 
 @app.get("/api/trigger-analysis")
-def trigger_analysis(background_tasks: BackgroundTasks, secret: str = ""):
+def trigger_analysis(secret: str = ""):
     if secret != CRON_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    background_tasks.add_task(MarcusAgent.execute_and_send)
-    return {"status": "Task running in background"}
+    
+    try:
+        # 抛弃后台任务，强行前台同步执行！
+        # 此时 Vercel 必须等这行代码彻底跑完（发完 TG 消息），才会返回结果。
+        result_msg = MarcusAgent.execute_and_send()
+        return {"status": "Success", "detail": result_msg}
+    except Exception as e:
+        # 如果崩溃，真凶会直接暴露在屏幕上
+        return {"status": "Failed", "error": str(e)}
