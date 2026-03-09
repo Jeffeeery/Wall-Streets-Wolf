@@ -108,7 +108,7 @@ class MarcusAgent:
         
         # 发送 Telegram
         tg_url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        requests.post(tg_url, json={"chat_id": TG_CHAT_ID, "text": report, "parse_mode": "Markdown", "disable_web_page_preview": True})
+        requests.post(tg_url, json={"chat_id": TG_CHAT_ID, "text": report, "disable_web_page_preview": True})
 
 # ==========================================
 # 4. API 路由 (强制前台同步版本)
