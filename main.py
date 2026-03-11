@@ -1,10 +1,10 @@
 """
 Marcus Wolf — 4H Tactical Market Intelligence Agent
 =====================================================
-优化版 v3.0：
-  ✅ 仅保留战术透镜 (4H) — 去掉 1D，Yahoo 请求减半
-  ✅ 数据抓取 + Redis 读取完全并行（方案B）
-  ✅ Prompt 精简，max_tokens 1024 → 更快生成
+v3.1 修复：
+  ✅ 彻底修复 Telegram MarkdownV2 截断问题
+     → Gemini 只输出纯结构文本（JSON），代码层统一格式化 + 转义
+  ✅ 保留 v3.0 全部并行优化
 """
 
 import os
@@ -38,17 +38,16 @@ UPSTASH_TOKEN  = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 
 TIMEZONE     = "Asia/Kuala_Lumpur"
 GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_URL   = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+GEMINI_URL   = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+)
 
 WATCHLIST = ["^GSPC", "CL=F", "GC=F", "NVDA", "AAPL", "^VIX", "BTC-USD"]
+INTERVAL  = "60m"
+RANGE     = "60d"
 
-# ✅ 只保留 4H（Yahoo 60m interval，60d range ≈ 60 根 4H K线）
-# 请求数：7 个品种 × 1 个时间框架 = 7 次（原来 14 次）
-INTERVAL = "60m"
-RANGE    = "60d"
-TF_LABEL = "战术透镜 (4H)"
-
-app   = FastAPI(title="MarcusWolf", version="3.0")
+app   = FastAPI(title="MarcusWolf", version="3.1")
 redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
 
 
@@ -57,15 +56,14 @@ redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
 # ==========================================
 @app.on_event("startup")
 async def validate_env():
-    required = {
+    missing = [k for k, v in {
         "GEMINI_API_KEY": GEMINI_API_KEY,
-        "TG_TOKEN": TG_TOKEN,
-        "TG_CHAT_ID": TG_CHAT_ID,
-        "CRON_SECRET": CRON_SECRET,
-        "UPSTASH_REDIS_REST_URL": UPSTASH_URL,
+        "TG_TOKEN":       TG_TOKEN,
+        "TG_CHAT_ID":     TG_CHAT_ID,
+        "CRON_SECRET":    CRON_SECRET,
+        "UPSTASH_REDIS_REST_URL":   UPSTASH_URL,
         "UPSTASH_REDIS_REST_TOKEN": UPSTASH_TOKEN,
-    }
-    missing = [k for k, v in required.items() if not v]
+    }.items() if not v]
     if missing:
         raise RuntimeError(f"❌ 缺少环境变量：{missing}")
     log.info("✅ 所有环境变量已就绪")
@@ -73,35 +71,97 @@ async def validate_env():
 
 # ==========================================
 # 2. Telegram 工具
+#    根本修复：代码层转义，而非依赖 Gemini 自己转义
 # ==========================================
-def escape_md_v2(text: str) -> str:
-    reserved = r"_*[]()~`>#+-=|{}.!\\"
-    return re.sub(f"([{re.escape(reserved)}])", r"\\\1", text)
+def escape_mdv2(text: str) -> str:
+    """
+    对"纯文本内容"转义 MarkdownV2 保留字符。
+    注意：只对内容字符串调用，不要对整条消息调用，
+    否则会把 *bold* 的星号也转义掉。
+    """
+    # MarkdownV2 需要转义的 12 个字符
+    return re.sub(r"([_*\[\]()~`>#+=|{}.!\\-])", r"\\\1", text)
 
 
-async def send_telegram(text: str, parse_mode: str = "MarkdownV2") -> bool:
+def build_telegram_message(report: dict, now_str: str) -> str:
+    """
+    从 Gemini 返回的结构化 JSON 组装 MarkdownV2 消息。
+    格式化逻辑在 Python 里，Gemini 只负责内容。
+    """
+    lines = []
+
+    # ── 标题 ──────────────────────────────────────────────
+    lines.append(f"*🐺 Marcus Wolf 战情室*")
+    lines.append(f"*📅 {escape_mdv2(now_str)}*")
+    lines.append("")
+
+    # ── 品种扫描 ──────────────────────────────────────────
+    lines.append("*━━━ 品种扫描 \\(4H\\) ━━━*")
+    for item in report.get("scan", []):
+        sym    = escape_mdv2(item.get("symbol", ""))
+        signal = escape_mdv2(item.get("signal", ""))
+        action = escape_mdv2(item.get("action", ""))
+        lines.append(f"• `{sym}` {signal} → {action}")
+    lines.append("")
+
+    # ── 高概率信号 ────────────────────────────────────────
+    lines.append("*━━━ 🎯 高概率信号 ━━━*")
+    top_signals = report.get("top_signals", [])
+    if top_signals:
+        for sig in top_signals:
+            sym    = escape_mdv2(sig.get("symbol", ""))
+            kind   = escape_mdv2(sig.get("type", ""))
+            advice = escape_mdv2(sig.get("advice", ""))
+            lines.append(f"• `{sym}` \\| {kind} \\| {advice}")
+    else:
+        lines.append("• 当前无明确高概率信号，观望")
+    lines.append("")
+
+    # ── 核心结论 ──────────────────────────────────────────
+    lines.append("*━━━ 核心结论 ━━━*")
+    for sentence in report.get("conclusion", []):
+        lines.append(escape_mdv2(sentence))
+    lines.append("")
+
+    # ── 风险提示 ──────────────────────────────────────────
+    lines.append("*━━━ ⚠️ 风险提示 ━━━*")
+    for risk in report.get("risks", []):
+        lines.append(f"• {escape_mdv2(risk)}")
+
+    return "\n".join(lines)
+
+
+async def send_telegram(text: str) -> bool:
+    """发送 MarkdownV2 消息，失败时自动 fallback 纯文本。"""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(url, json={
-            "chat_id": TG_CHAT_ID,
-            "text": text,
-            "parse_mode": parse_mode,
+        # 尝试 MarkdownV2
+        resp = await client.post(url, json={
+            "chat_id":    TG_CHAT_ID,
+            "text":       text,
+            "parse_mode": "MarkdownV2",
         })
-        if r.status_code == 200:
+        data = resp.json()
+        if data.get("ok"):
             return True
 
-        log.warning(f"TG {parse_mode} 发送失败 ({r.status_code})，降级为纯文本…")
-        plain = re.sub(r"[_*`\[\]()~>#+=|{}.!\\-]", "", text)
-        r2 = await client.post(url, json={"chat_id": TG_CHAT_ID, "text": plain})
-        if r2.status_code == 200:
+        log.warning(f"MarkdownV2 发送失败：{data.get('description')} — 降级纯文本")
+
+        # fallback：去掉所有 markdown 符号
+        plain = re.sub(r"[\\*_`\[\]()~>#+=|{}.!-]", "", text)
+        resp2 = await client.post(url, json={
+            "chat_id": TG_CHAT_ID,
+            "text":    plain[:4096],   # Telegram 单消息上限
+        })
+        if resp2.json().get("ok"):
             return True
 
-        log.error(f"TG 纯文本也失败：{r2.text}")
+        log.error(f"纯文本也失败：{resp2.text}")
         return False
 
 
 # ==========================================
-# 3. 量化计算引擎
+# 3. 量化计算引擎（与 v3.0 相同）
 # ==========================================
 class QuantUtils:
 
@@ -109,54 +169,42 @@ class QuantUtils:
     def calculate_rsi(prices: list[float], period: int = 14) -> float:
         if len(prices) < period + 1:
             return 50.0
-        deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
-        gains  = [max(0.0, d) for d in deltas[:period]]
-        losses = [max(0.0, -d) for d in deltas[:period]]
-        avg_gain = sum(gains) / period
-        avg_loss = sum(losses) / period
+        deltas   = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+        avg_gain = sum(max(0.0, d) for d in deltas[:period]) / period
+        avg_loss = sum(max(0.0, -d) for d in deltas[:period]) / period
         for delta in deltas[period:]:
-            avg_gain = (avg_gain * (period - 1) + max(0.0, delta))  / period
+            avg_gain = (avg_gain * (period - 1) + max(0.0,  delta)) / period
             avg_loss = (avg_loss * (period - 1) + max(0.0, -delta)) / period
-        if avg_loss == 0:
-            return 100.0
-        return round(100.0 - 100.0 / (1.0 + avg_gain / avg_loss), 2)
+        return 100.0 if avg_loss == 0 else round(100.0 - 100.0 / (1.0 + avg_gain / avg_loss), 2)
 
     @staticmethod
     def detect_ma_trend(closes: list[float], fast: int = 20, slow: int = 50) -> str:
         if len(closes) < slow:
             return "FLAT"
-        ma_f = sum(closes[-fast:]) / fast
-        ma_s = sum(closes[-slow:]) / slow
-        diff = (ma_f - ma_s) / ma_s
-        if diff > 0.003:   return "UP"
-        if diff < -0.003:  return "DOWN"
+        diff = (sum(closes[-fast:]) / fast - sum(closes[-slow:]) / slow) / (sum(closes[-slow:]) / slow)
+        if diff > 0.003:  return "UP"
+        if diff < -0.003: return "DOWN"
         return "FLAT"
 
     @staticmethod
-    def calculate_atr(highs: list[float], lows: list[float],
-                      closes: list[float], period: int = 14) -> float:
+    def calculate_atr_pct(highs, lows, closes, period: int = 14) -> float:
         if len(closes) < period + 1:
             return 0.0
-        trs = []
-        for i in range(1, len(closes)):
-            tr = max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes[i - 1]),
-                abs(lows[i]  - closes[i - 1])
-            )
-            trs.append(tr)
-        atr = sum(trs[-period:]) / period
-        return round(atr / closes[-1] * 100, 3)
+        trs = [
+            max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+            for i in range(1, len(closes))
+        ]
+        return round(sum(trs[-period:]) / period / closes[-1] * 100, 3)
 
     @staticmethod
-    def safe_vol_ratio(volumes: list[float]) -> float:
-        if not volumes or len(volumes) < 2:
+    def vol_ratio(volumes: list[float]) -> float:
+        if len(volumes) < 2:
             return 1.0
         avg = sum(volumes[-20:]) / len(volumes[-20:])
         return round(volumes[-1] / avg, 2) if avg > 0 else 1.0
 
     @staticmethod
-    def get_rsi_signal(rsi: float) -> str:
+    def rsi_signal(rsi: float) -> str:
         if rsi >= 75: return "严重超买"
         if rsi >= 65: return "超买"
         if rsi <= 25: return "严重超卖"
@@ -164,191 +212,163 @@ class QuantUtils:
         return "中性"
 
     @staticmethod
-    def classify_vol_ratio(ratio: float) -> str:
-        if ratio >= 2.0:  return "放量(>2x)"
+    def vol_signal(ratio: float) -> str:
+        if ratio >= 2.0:  return "放量>2x"
         if ratio >= 1.3:  return "温和放量"
         if ratio <= 0.5:  return "缩量"
         return "正常"
 
 
 # ==========================================
-# 4. 异步数据引擎（纯 4H）
+# 4. 异步数据引擎
 # ==========================================
 class AsyncDataEngine:
-
-    @staticmethod
-    async def _fetch_raw(client: httpx.AsyncClient, sym: str) -> list[dict]:
-        url = (
-            f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}"
-            f"?range={RANGE}&interval={INTERVAL}"
-        )
-        resp = await client.get(url, timeout=12)
-        resp.raise_for_status()
-        result = resp.json()["chart"]["result"][0]
-        q = result["indicators"]["quote"][0]
-        return [
-            {"c": c, "h": h, "l": l, "v": float(v or 0)}
-            for c, h, l, v in zip(q["close"], q["high"], q["low"], q["volume"])
-            if c is not None and h is not None and l is not None
-        ]
-
-    @staticmethod
-    def _compute_metrics(bars: list[dict]) -> dict:
-        if len(bars) < 2:
-            return {"error": "数据不足"}
-        closes  = [b["c"] for b in bars]
-        highs   = [b["h"] for b in bars]
-        lows    = [b["l"] for b in bars]
-        volumes = [b["v"] for b in bars]
-        latest, prev = closes[-1], closes[-2]
-        pct_change   = round((latest - prev) / prev * 100, 2)
-        rsi          = QuantUtils.calculate_rsi(closes)
-        trend        = QuantUtils.detect_ma_trend(closes)
-        atr_pct      = QuantUtils.calculate_atr(highs, lows, closes)
-        vol_ratio    = QuantUtils.safe_vol_ratio(volumes)
-        return {
-            "price":      round(latest, 4),
-            "pct":        pct_change,
-            "rsi":        rsi,
-            "rsi_signal": QuantUtils.get_rsi_signal(rsi),
-            "trend":      trend,
-            "atr_pct":    atr_pct,
-            "vol_ratio":  vol_ratio,
-            "vol_signal": QuantUtils.classify_vol_ratio(vol_ratio),
-        }
+    HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MarcusWolf/3.1)"}
 
     @classmethod
     async def _fetch_symbol(cls, client: httpx.AsyncClient,
                             sym: str, retries: int = 2) -> tuple[str, dict]:
-        last_err = None
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}?range={RANGE}&interval={INTERVAL}"
         for attempt in range(retries + 1):
             try:
-                bars = await cls._fetch_raw(client, sym)
-                return sym, cls._compute_metrics(bars)
+                resp = await client.get(url, timeout=12)
+                resp.raise_for_status()
+                result = resp.json()["chart"]["result"][0]
+                q = result["indicators"]["quote"][0]
+                clean = [
+                    (c, h, l, float(v or 0))
+                    for c, h, l, v in zip(q["close"], q["high"], q["low"], q["volume"])
+                    if None not in (c, h, l)
+                ]
+                if len(clean) < 2:
+                    return sym, {"error": "数据不足"}
+                closes, highs, lows, volumes = zip(*clean)
+                closes, highs, lows, volumes = list(closes), list(highs), list(lows), list(volumes)
+                latest, prev = closes[-1], closes[-2]
+                vr = QuantUtils.vol_ratio(volumes)
+                rsi = QuantUtils.calculate_rsi(closes)
+                return sym, {
+                    "price":      round(latest, 4),
+                    "pct":        round((latest - prev) / prev * 100, 2),
+                    "rsi":        rsi,
+                    "rsi_signal": QuantUtils.rsi_signal(rsi),
+                    "trend":      QuantUtils.detect_ma_trend(closes),
+                    "atr_pct":    QuantUtils.calculate_atr_pct(highs, lows, closes),
+                    "vol_ratio":  vr,
+                    "vol_signal": QuantUtils.vol_signal(vr),
+                }
             except Exception as e:
-                last_err = e
                 if attempt < retries:
                     await asyncio.sleep(1.0 * (attempt + 1))
-        return sym, {"error": str(last_err)}
+                else:
+                    return sym, {"error": str(e)}
 
     @classmethod
     async def get_market_snapshot(cls, symbols: list[str]) -> dict:
-        async with httpx.AsyncClient(
-            headers={"User-Agent": "Mozilla/5.0 (compatible; MarcusWolf/3.0)"},
-            follow_redirects=True,
-        ) as client:
-            tasks = [cls._fetch_symbol(client, s) for s in symbols]
-            results = await asyncio.gather(*tasks)
+        async with httpx.AsyncClient(headers=cls.HEADERS, follow_redirects=True) as client:
+            results = await asyncio.gather(*[cls._fetch_symbol(client, s) for s in symbols])
             return dict(results)
 
 
 # ==========================================
-# 5. Gemini AI 调用
+# 5. Gemini 调用
+#    ✅ 关键改变：要求 Gemini 返回 JSON，不要求它做任何 Markdown 转义
 # ==========================================
-async def call_gemini(prompt: str, max_tokens: int = 1024) -> str:
+GEMINI_SYSTEM_PROMPT = """你是 Marcus Wolf，顶级量化对冲基金首席分析师。犀利、精准、不废话。
+
+## 输出规则（严格遵守）
+1. 只返回一个合法 JSON 对象，不要加 ```json 围栏，不要任何前缀/后缀文字
+2. JSON 结构如下：
+{
+  "scan": [
+    {"symbol": "^GSPC", "signal": "RSI65超买+放量", "action": "关注回调风险"}
+    // 每个 WATCHLIST 品种一条
+  ],
+  "top_signals": [
+    {"symbol": "NVDA", "type": "趋势突破", "advice": "站稳MA20可追多，止损ATR1.5倍"}
+    // 1-3条最强信号，无明确信号则返回空数组 []
+  ],
+  "conclusion": [
+    "整体格局一句话",
+    "最值得关注的机会或风险",
+    "与上次分析对比变化"
+  ],
+  "risks": [
+    "最大尾部风险描述"
+  ]
+}
+3. 所有字符串值为纯文本，不要包含 Markdown 符号（* _ ` [ ] 等）
+4. 数值保留原始精度，不要四舍五入到整数"""
+
+
+async def call_gemini(snapshot: dict, memory: dict, now_str: str) -> dict:
+    slim = {
+        sym: {k: v for k, v in data.items() if "error" not in data}
+        for sym, data in snapshot.items()
+    }
+    user_content = (
+        f"当前时间：{now_str}\n"
+        f"市场快照（4H）：{json.dumps(slim, ensure_ascii=False, separators=(',', ':'))}\n"
+        f"上次结论（{memory.get('time', 'N/A')}）：{memory.get('conclusion', '首次运行')}"
+    )
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "maxOutputTokens": max_tokens,   # ✅ 1024，比原来少一半
-            "temperature": 0.65,
-            "topP": 0.9,
-        },
-        "safetySettings": [
-            {"category": "HARM_CATEGORY_HARASSMENT",        "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH",       "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-        ],
+        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
+        "contents":           [{"role": "user", "parts": [{"text": user_content}]}],
+        "generationConfig":   {"maxOutputTokens": 1024, "temperature": 0.3, "topP": 0.9},
     }
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(GEMINI_URL, json=payload)
         resp.raise_for_status()
-        data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+    # ── 清理 Gemini 偶尔加的 ```json 围栏 ──────────────────
+    raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+    raw_text = re.sub(r"\s*```$", "", raw_text)
+
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        log.error(f"Gemini JSON 解析失败：{e}\n原始输出：{raw_text[:400]}")
+        # 兜底结构，确保消息能正常发出
+        return {
+            "scan":         [],
+            "top_signals":  [],
+            "conclusion":   [f"AI 解析异常，请检查日志", raw_text[:200]],
+            "risks":        ["无法生成风险分析"],
+        }
 
 
 # ==========================================
-# 6. Prompt 构造器（精简版，纯 4H）
-# ==========================================
-def build_prompt(snapshot: dict, memory: dict) -> str:
-    # ✅ 只传关键字段，裁掉冗余，节省 input token
-    slim_snapshot = {
-        sym: {k: v for k, v in data.items()
-              if k in ("price", "pct", "rsi", "rsi_signal", "trend", "atr_pct", "vol_ratio", "vol_signal")}
-        for sym, data in snapshot.items()
-        if "error" not in data
-    }
-    snapshot_str = json.dumps(slim_snapshot, ensure_ascii=False, separators=(",", ":"))
-    memory_str   = memory.get("conclusion", "暂无历史记录")
-    last_time    = memory.get("time", "N/A")
-    now_str      = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d %H:%M MYT")
-
-    return f"""你是 Marcus Wolf——顶级量化对冲基金首席分析师。犀利、精准、不废话。
-
-📊 4H 市场快照（{now_str}）
-{snapshot_str}
-
-字段：price=价格 pct=涨跌% rsi/rsi_signal=RSI trend=MA趋势(UP/DOWN/FLAT) atr_pct=波动率% vol_ratio/vol_signal=量比
-
-🧠 上次结论（{last_time}）：{memory_str}
-
-━━━ 输出格式（Telegram MarkdownV2，严格遵守）━━━
-- 标题用 *粗体*，关键数值用 `代码格式`
-- 不用 # 标题，不用 HTML，特殊字符加反斜杠转义
-- 每个品种不超过 2 行
-
-*🐺 Marcus Wolf 战情室*
-*📅 {now_str}*
-
-*━━━ 品种扫描 \(4H\) ━━━*
-[每个品种：趋势+RSI信号+成交量，一句话点出操作意义]
-
-*━━━ 🎯 高概率信号 ━━━*
-[列出 1\-3 个最强信号：品种 \| 信号类型 \| 操作建议]
-
-*━━━ 核心结论 ━━━*
-[3句话：整体格局 \+ 最值得关注的机会/风险 \+ 与上次对比变化]
-
-*━━━ ⚠️ 风险提示 ━━━*
-[1\-2句，指出最大尾部风险]
-
-开始分析。
-"""
-
-
-# ==========================================
-# 7. Marcus Wolf 主管线（并行优化版）
+# 6. Marcus Wolf 主管线
 # ==========================================
 class MarcusWolf:
 
     @staticmethod
     async def run_pipeline() -> dict:
-        now = datetime.now(pytz.timezone(TIMEZONE))
-        log.info(f"[{now.isoformat()}] 🚀 启动 Marcus Wolf v3.0…")
+        now     = datetime.now(pytz.timezone(TIMEZONE))
+        now_str = now.strftime("%Y-%m-%d %H:%M MYT")
+        log.info(f"[{now.isoformat()}] 🚀 Marcus Wolf v3.1 启动…")
 
-        # ✅ 方案B：数据抓取 + Redis 读取 同时并行启动
-        log.info("📡 并行启动：市场数据抓取 + Redis 记忆读取…")
+        # 并行：数据抓取 + Redis 读取
         snapshot, raw_mem = await asyncio.gather(
             AsyncDataEngine.get_market_snapshot(WATCHLIST),
             redis.get("marcus_memory_v3"),
         )
-
         ok_count = sum(1 for d in snapshot.values() if "error" not in d)
-        log.info(f"   数据质量：{ok_count}/{len(WATCHLIST)} 个品种成功")
+        log.info(f"数据质量：{ok_count}/{len(WATCHLIST)} | 历史记忆：{'有' if raw_mem else '无'}")
 
         memory = json.loads(raw_mem) if raw_mem else {}
-        log.info(f"   历史记忆：{'有' if memory else '无（首次运行）'}")
 
-        # ── Gemini 分析 ──────────────────────────────────────
-        prompt = build_prompt(snapshot, memory)
-        log.info("🤖 调用 Gemini（4H 战术分析）…")
-        report = await call_gemini(prompt, max_tokens=1024)
-        log.info(f"   生成报告：{len(report)} 字符")
+        # Gemini 分析（返回结构化 JSON）
+        report_json = await call_gemini(snapshot, memory, now_str)
+        log.info(f"Gemini 返回结构：{list(report_json.keys())}")
 
-        # ── 提取结论 + 持久化记忆 ────────────────────────────
-        conclusion_match = re.search(r"核心结论[^\n]*\n(.*?)(?=━|$)", report, re.DOTALL)
-        conclusion_text  = conclusion_match.group(1).strip()[:300] if conclusion_match else report[:300]
+        # 代码层组装 MarkdownV2（不再依赖 Gemini 转义）
+        tg_message = build_telegram_message(report_json, now_str)
+        log.info(f"组装消息：{len(tg_message)} 字符")
 
+        # 提取结论用于记忆
+        conclusion_text = " ".join(report_json.get("conclusion", []))[:300]
         new_memory = {
             "time":       now.isoformat(),
             "conclusion": conclusion_text,
@@ -356,30 +376,27 @@ class MarcusWolf:
                 sym: {"trend": data.get("trend"), "rsi": data.get("rsi")}
                 for sym, data in snapshot.items()
                 if "error" not in data
-            }
+            },
         }
 
-        # ✅ Redis 写入 + Telegram 推送 同时并行
-        log.info("💾📨 并行：Redis 写入 + Telegram 推送…")
-        save_task = redis.set("marcus_memory_v3", json.dumps(new_memory, ensure_ascii=False))
-        send_task = send_telegram(report, parse_mode="MarkdownV2")
-        _, success = await asyncio.gather(save_task, send_task)
-
-        log.info(f"   推送{'成功' if success else '失败（已降级）'}")
+        # 并行：Redis 写入 + Telegram 推送
+        _, success = await asyncio.gather(
+            redis.set("marcus_memory_v3", json.dumps(new_memory, ensure_ascii=False)),
+            send_telegram(tg_message),
+        )
+        log.info(f"推送{'成功' if success else '失败（已降级）'}")
 
         return {
             "status":        "ok" if success else "degraded",
-            "symbols":       len(WATCHLIST),
-            "timeframe":     "4H only",
-            "report_length": len(report),
-            "timestamp":     now.isoformat(),
+            "symbols":       ok_count,
+            "report_length": len(tg_message),
+            "timestamp":     now_str,
         }
 
 
 # ==========================================
-# 8. FastAPI 路由
+# 7. FastAPI 路由
 # ==========================================
-
 @app.get("/health")
 async def health():
     try:
@@ -391,10 +408,24 @@ async def health():
     return {
         "status":    "ok" if redis_ok else "degraded",
         "redis":     redis_ok,
+        "version":   "3.1",
         "timestamp": datetime.now(pytz.timezone(TIMEZONE)).isoformat(),
-        "watchlist": WATCHLIST,
-        "timeframe": "4H only",
     }
+
+
+@app.api_route("/api/trigger", methods=["GET", "POST"])
+async def handle_trigger(request: Request):
+    received = request.headers.get("Authorization", "")
+    expected = f"Bearer {CRON_SECRET}"
+    if received != expected:
+        masked = f"{CRON_SECRET[:3]}***" if CRON_SECRET else "None"
+        return {
+            "error":    "认证失败",
+            "received": received,
+            "expected": f"Bearer {masked}...",
+            "tip":      "检查 Authorization header 格式是否为 'Bearer <secret>'",
+        }
+    return await MarcusWolf.run_pipeline()
 
 
 @app.get("/api/snapshot")
@@ -402,22 +433,4 @@ async def get_snapshot(x_cron_secret: Optional[str] = Header(None)):
     if x_cron_secret != CRON_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
     snapshot = await AsyncDataEngine.get_market_snapshot(WATCHLIST)
-    return {"data": snapshot, "timeframe": "4H", "interval": INTERVAL, "range": RANGE}
-
-
-@app.api_route("/api/trigger", methods=["GET", "POST"])
-async def handle_trigger(request: Request):
-    received_auth = request.headers.get("Authorization")
-    env_secret    = os.environ.get("CRON_SECRET", "未设置")
-    expected      = f"Bearer {env_secret}"
-
-    if received_auth != expected:
-        masked_env = f"{env_secret[:3]}***" if env_secret else "None"
-        return {
-            "error":                    "钥匙没对上",
-            "you_sent":                 received_auth,
-            "server_expected_prefix":   f"Bearer {masked_env}",
-            "tip":                      "请检查 Bearer 后是否有空格，以及 Vercel 变量是否已 Redeploy"
-        }
-
-    return await MarcusWolf.run_pipeline()
+    return {"data": snapshot, "interval": INTERVAL, "range": RANGE}
