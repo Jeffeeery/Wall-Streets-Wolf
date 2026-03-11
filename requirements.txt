@@ -3,3 +3,4 @@ uvicorn
 upstash-redis
 pytz
 httpx
+requests
