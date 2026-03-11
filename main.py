@@ -510,7 +510,7 @@ async def get_snapshot(x_cron_secret: Optional[str] = Header(None)):
     snapshot = await AsyncDataEngine.get_market_snapshot(WATCHLIST)
     return {"data": snapshot, "timeframes": TIMEFRAMES}
 
-
+"""
 @app.post("/api/trigger")
 async def handle_trigger(x_cron_secret: Optional[str] = Header(None)):
     """Cron 触发端点（由 Vercel Cron / 外部调度器调用）。"""
@@ -518,6 +518,7 @@ async def handle_trigger(x_cron_secret: Optional[str] = Header(None)):
         raise HTTPException(status_code=401, detail="Unauthorized")
     result = await MarcusWolf.run_pipeline()
     return result
+"""
 
 @app.api_route("/api/trigger", methods=["GET", "POST"])
 async def debug_trigger(request: Request):
