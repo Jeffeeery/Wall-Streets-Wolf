@@ -511,21 +511,10 @@ async def get_snapshot(x_cron_secret: Optional[str] = Header(None)):
     return {"data": snapshot, "timeframes": TIMEFRAMES}
 
 
-@app.get("/api/trigger") # Vercel Cron 发送的是 GET
-async def handle_trigger(request: Request):
-    # 1. 从环境变量获取 Vercel 自动生成的密钥
-    # 注意：在 Vercel 部署面板中需确保 CRON_SECRET 已存在
-    cron_secret = os.environ.get("CRON_SECRET")
-    
-    # 2. 获取请求头中的 Authorization 信息
-    auth_header = request.headers.get("Authorization")
-    
-    # 3. 严格校验格式: "Bearer <SECRET>"
-    if not auth_header or auth_header != f"Bearer {cron_secret}":
-        log.warning("❌ 拦截到未授权的 Cron 调用尝试")
+@app.post("/api/trigger")
+async def handle_trigger(x_cron_secret: Optional[str] = Header(None)):
+    """Cron 触发端点（由 Vercel Cron / 外部调度器调用）。"""
+    if x_cron_secret != CRON_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    
-    # 4. 校验通过，执行 Marcus Wolf 的分析逻辑
-    log.info("✅ Cron 身份验证成功，启动分析管线...")
     result = await MarcusWolf.run_pipeline()
-    return {"status": "success", "data": result}
+    return result
