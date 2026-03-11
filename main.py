@@ -518,3 +518,23 @@ async def handle_trigger(x_cron_secret: Optional[str] = Header(None)):
         raise HTTPException(status_code=401, detail="Unauthorized")
     result = await MarcusWolf.run_pipeline()
     return result
+
+@app.api_route("/api/trigger", methods=["GET", "POST"])
+async def debug_trigger(request: Request):
+    # 获取收到的钥匙
+    received_auth = request.headers.get("Authorization")
+    # 获取服务器里存的钥匙（脱敏显示前3位）
+    env_secret = os.environ.get("CRON_SECRET", "未设置")
+    masked_env = f"{env_secret[:3]}***" if env_secret else "None"
+    
+    # 如果没对上，我们把具体的对比结果返回（仅限调试使用，测完删掉！）
+    expected = f"Bearer {env_secret}"
+    if received_auth != expected:
+        return {
+            "error": "钥匙没对上",
+            "you_sent": received_auth,
+            "server_expected_prefix": f"Bearer {masked_env}",
+            "tip": "请检查 Bearer 后是否有空格，以及 Vercel 变量是否已 Redeploy"
+        }
+
+    return await MarcusWolf.run_pipeline()
