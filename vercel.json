@@ -11,9 +11,5 @@
       "dest": "main.py"
     }
   ],
-  "crons": [
-    {
-      "path": "/api/trigger",
-    }
-  ]
 }
+
