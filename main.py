@@ -5,7 +5,6 @@ Marcus Wolf — 4H Tactical Market Intelligence Agent
   ✅ 仅保留战术透镜 (4H) — 去掉 1D，Yahoo 请求减半
   ✅ 数据抓取 + Redis 读取完全并行（方案B）
   ✅ Prompt 精简，max_tokens 1024 → 更快生成
-  预计总耗时：5~9s
 """
 
 import os
