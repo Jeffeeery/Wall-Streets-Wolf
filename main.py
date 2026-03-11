@@ -314,7 +314,7 @@ async def call_gemini(snapshot: dict, memory: dict, now_str: str) -> dict:
     payload = {
         "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
         "contents":           [{"role": "user", "parts": [{"text": user_content}]}],
-        "generationConfig":   {"maxOutputTokens": 1024, "temperature": 0.3, "topP": 0.9},
+        "generationConfig":   {"maxOutputTokens": 2000, "temperature": 0.3, "topP": 0.9},
     }
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(GEMINI_URL, json=payload)
