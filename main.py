@@ -326,42 +326,30 @@ ma_trend=均线方向[UP/DOWN/FLAT] | vol_ratio=量比(>1.5为放量) | ATR_14=�
 
 
 # ==========================================
-# 7. FastAPI 路由
+# 5. API 路由
 # ==========================================
-@app.get("/health")
-async def health():
-    try:
-        await redis.ping()
-        redis_ok = True
-    except Exception as e:
-        redis_ok = False
-        log.warning(f"Redis ping 失败：{e}")
+@app.get("/")
+def health_check():
     return {
-        "status":    "ok" if redis_ok else "degraded",
-        "redis":     redis_ok,
-        "version":   "3.1",
-        "timestamp": datetime.now(pytz.timezone(TIMEZONE)).isoformat(),
+        "status":  "Marcus Wolf Online",
+        "model":   GEMINI_MODEL,
+        "version": "2.0",
     }
 
 
-@app.api_route("/api/trigger", methods=["GET", "POST"])
-async def handle_trigger(request: Request):
-    received = request.headers.get("Authorization", "")
-    expected = f"Bearer {CRON_SECRET}"
-    if received != expected:
-        masked = f"{CRON_SECRET[:3]}***" if CRON_SECRET else "None"
-        return {
-            "error":    "认证失败",
-            "received": received,
-            "expected": f"Bearer {masked}...",
-            "tip":      "检查 Authorization header 格式是否为 'Bearer <secret>'",
-        }
-    return await MarcusWolf.run_pipeline()
-
-
-@app.get("/api/snapshot")
-async def get_snapshot(x_cron_secret: Optional[str] = Header(None)):
-    if x_cron_secret != CRON_SECRET:
+@app.get("/api/trigger-analysis")
+def trigger_analysis(secret: str = ""):
+    if secret != CRON_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    snapshot = await AsyncDataEngine.get_market_snapshot(WATCHLIST)
-    return {"data": snapshot, "interval": INTERVAL, "range": RANGE}
+
+    try:
+        result_msg = MarcusAgent.execute_and_send()
+        return {"status": "Success", "detail": result_msg}
+    except Exception as e:
+        # 暴露完整错误链，便于调试
+        import traceback
+        return {
+            "status": "Failed",
+            "error":  str(e),
+            "trace":  traceback.format_exc()[-800:],
+        }
