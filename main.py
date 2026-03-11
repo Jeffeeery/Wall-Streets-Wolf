@@ -17,7 +17,7 @@ from typing import Optional
 
 import httpx
 import pytz
-from fastapi import FastAPI, HTTPException, Header, Requests
+from fastapi import FastAPI, HTTPException, Header, Request
 from upstash_redis.asyncio import Redis  # ✅ 异步 SDK
 
 # ==========================================
