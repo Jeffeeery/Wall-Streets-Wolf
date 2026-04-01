@@ -1,29 +1,47 @@
-import os
+import hmac
 import json
-import requests
+import logging
+import os
+import traceback as tb
 from datetime import datetime
+
 import pytz
+import requests
 from fastapi import FastAPI, HTTPException
 from upstash_redis import Redis
 
 # ==========================================
 # 1. 环境变量
 # ==========================================
-GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY")
-TG_TOKEN        = os.environ.get("TG_TOKEN")
-TG_CHAT_ID      = os.environ.get("TG_CHAT_ID")
-CRON_SECRET     = os.environ.get("CRON_SECRET")
-UPSTASH_URL     = os.environ.get("UPSTASH_REDIS_REST_URL")
-UPSTASH_TOKEN   = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+TG_TOKEN       = os.environ.get("TG_TOKEN")
+TG_CHAT_ID     = os.environ.get("TG_CHAT_ID")
+CRON_SECRET    = os.environ.get("CRON_SECRET", "")
+UPSTASH_URL    = os.environ.get("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN  = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 
 TIMEZONE  = "Asia/Kuala_Lumpur"
 WATCHLIST = ["^GSPC", "CL=F", "GC=F", "NVDA", "AAPL", "^VIX", "BTC-USD"]
 
-# 模型名称统一管理，方便未来切换
-GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+GEMINI_MODEL = "gemini-2.0-flash-lite"
 
-app   = FastAPI()
-redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# 懒加载 Redis，避免模块级 None 初始化崩溃
+_redis: Redis | None = None
+
+def get_redis() -> Redis:
+    global _redis
+    if _redis is None:
+        _redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
+    return _redis
+
 
 # ==========================================
 # 2. 量化指标计算
@@ -33,13 +51,11 @@ def calculate_rsi(prices: list[float], period: int = 14) -> float:
     if len(prices) < period + 1:
         return 50.0
 
-    # 初始化：用前 period 根 K 线的简单均值
     gains  = [max(0.0, prices[i] - prices[i - 1]) for i in range(1, period + 1)]
     losses = [max(0.0, prices[i - 1] - prices[i]) for i in range(1, period + 1)]
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
 
-    # Wilder 平滑（EMA 变体）
     for i in range(period + 1, len(prices)):
         delta    = prices[i] - prices[i - 1]
         avg_gain = (avg_gain * (period - 1) + max(0.0, delta))  / period
@@ -52,10 +68,7 @@ def calculate_rsi(prices: list[float], period: int = 14) -> float:
 
 
 def detect_ma_trend(closes: list[float], fast: int = 20, slow: int = 50) -> str:
-    """
-    用快慢双均线判断趋势方向。
-    返回: UP / DOWN / FLAT
-    """
+    """用快慢双均线判断趋势方向。返回: UP / DOWN / FLAT"""
     if len(closes) < slow:
         return "FLAT"
     ma_fast = sum(closes[-fast:]) / fast
@@ -80,7 +93,6 @@ def calculate_atr(highs, lows, closes, period: int = 14) -> float:
             abs(lows[i]  - closes[i - 1]),
         )
         trs.append(tr)
-    # 只用最近 period 根
     recent = trs[-period:]
     return round(sum(recent) / len(recent), 4)
 
@@ -96,7 +108,7 @@ class QuantDataEngine:
             "Chrome/124.0.0.0 Safari/537.36"
         )
     }
-    REQUEST_TIMEOUT = 10  # 秒
+    REQUEST_TIMEOUT = 10
 
     @staticmethod
     def fetch_and_calculate(symbols: list[str]) -> dict:
@@ -117,8 +129,6 @@ class QuantDataEngine:
                 result = res["chart"]["result"][0]
                 quote  = result["indicators"]["quote"][0]
 
-                # ── 清洗数据：过滤 None ──────────────────────────────
-                # zip 三列，只保留全部有值的行
                 raw_rows = zip(
                     quote.get("close",  []),
                     quote.get("high",   []),
@@ -141,13 +151,12 @@ class QuantDataEngine:
                 latest, prev = closes[-1], closes[-2]
                 pct_change   = (latest - prev) / prev * 100
 
-                sma200    = sum(closes[-200:]) / min(200, len(closes))
-                sma50     = sum(closes[-50:])  / min(50,  len(closes))
-                rsi_14    = calculate_rsi(closes)
-                ma_trend  = detect_ma_trend(closes)
-                atr_14    = calculate_atr(highs, lows, closes)
+                sma200   = sum(closes[-200:]) / min(200, len(closes))
+                sma50    = sum(closes[-50:])  / min(50,  len(closes))
+                rsi_14   = calculate_rsi(closes)
+                ma_trend = detect_ma_trend(closes)
+                atr_14   = calculate_atr(highs, lows, closes)
 
-                # 量比：今日成交量 / 近 20 日均量
                 avg_vol20 = sum(volumes[-20:]) / min(20, len(volumes))
                 vol_ratio = round(volumes[-1] / avg_vol20, 2) if avg_vol20 else 1.0
 
@@ -157,14 +166,13 @@ class QuantDataEngine:
                     "RSI_14":      rsi_14,
                     "above_MA200": latest > sma200,
                     "above_MA50":  latest > sma50,
-                    "ma_trend":    ma_trend,       # UP / DOWN / FLAT
-                    "vol_ratio":   vol_ratio,       # >1.5 = 放量
+                    "ma_trend":    ma_trend,
+                    "vol_ratio":   vol_ratio,
                     "ATR_14":      atr_14,
                 }
 
             except Exception as e:
-                print(f"[QuantDataEngine] 跳过 {sym}: {e}")
-                market_state[sym] = {"error": str(e)}
+                log.warning("[QuantDataEngine] 跳过 %s: %s", sym, e)
 
         return market_state
 
@@ -174,7 +182,6 @@ class QuantDataEngine:
 # ==========================================
 class MarcusAgent:
 
-    # ── Prompt 模板 ────────────────────────────────────────────────
     SYSTEM_PROMPT = """你是 Marcus Wolf，一名冷静、精确的量化宏观分析师。
 
 ## 铁律（违反则输出无效）
@@ -210,23 +217,23 @@ ma_trend=均线方向[UP/DOWN/FLAT] | vol_ratio=量比(>1.5为放量) | ATR_14=�
 [每条结尾标注置信度：高/中/低；格式：现象 → 原因推断 → 潜在影响 \\[推测\\]]
 
 ⚖️ *纠偏 & 上期复盘*
-上期预判：[摘要上期结论，无则填"首次运行"]
+上期预判：[摘要上期结论，无则填\"首次运行\"]
 本期验证：[命中 ✅ / 偏差 ❌ / 无法验证 ⚠️]
 最大不确定因子：[1条]
 
-⚡ *操作参考*（信号不明确时输出"信号不足，观望"）
+⚡ *操作参考*（信号不明确时输出\"信号不足，观望\"）
 [关注品种 | 方向 | 触发条件]
 ---"""
 
-    # ── 核心执行 ───────────────────────────────────────────────────
     @staticmethod
     def execute_and_send() -> str:
-        # 1. 拉取量化数据
-        current_data_dict = QuantDataEngine.fetch_and_calculate(WATCHLIST)
+        # 1. 拉取量化数据，过滤掉拉取失败的品种
+        raw_data = QuantDataEngine.fetch_and_calculate(WATCHLIST)
+        current_data_dict = {k: v for k, v in raw_data.items() if "error" not in v}
         current_data_json = json.dumps(current_data_dict, indent=2, ensure_ascii=False)
 
         # 2. 读取历史记忆
-        last_data = redis.get("marcus_memory")
+        last_data = get_redis().get("marcus_memory")
         last_mem  = json.loads(last_data) if last_data else None
         if last_mem:
             history_context = (
@@ -243,24 +250,18 @@ ma_trend=均线方向[UP/DOWN/FLAT] | vol_ratio=量比(>1.5为放量) | ATR_14=�
             history_context=history_context,
         )
 
-        # 4. 调用 Gemini（system + user 分离）
+        # 4. 调用 Gemini
         gemini_url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
         )
         payload = {
-            "system_instruction": {
-                "parts": [{"text": MarcusAgent.SYSTEM_PROMPT}]
-            },
-            "contents": [
-                {"role": "user", "parts": [{"text": user_prompt}]}
-            ],
-            "generationConfig": {
-                "temperature":     0.3,   # 低温 = 更稳定、更少幻觉
-                "maxOutputTokens": 1024,
-            },
+            "system_instruction": {"parts": [{"text": MarcusAgent.SYSTEM_PROMPT}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 1024},
         }
 
+        gemini_res: dict = {}
         try:
             gemini_res = requests.post(
                 gemini_url,
@@ -270,17 +271,12 @@ ma_trend=均线方向[UP/DOWN/FLAT] | vol_ratio=量比(>1.5为放量) | ATR_14=�
             ).json()
             report = gemini_res["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError, requests.RequestException) as e:
-            report = (
-                f"⚠️ *Marcus Wolf 分析引擎异常*\n"
-                f"错误：`{str(e)[:200]}`\n"
-                f"原始响应片段：`{str(gemini_res)[:300]}`"
-            )
+            log.error("Gemini 调用失败: %s | 响应: %s", e, str(gemini_res)[:300])
+            report = "⚠️ *Marcus Wolf 分析引擎异常*\n`分析暂时不可用，请稍后重试。`"
 
-        # 5. 更新结构化记忆（存核心结论 + 快照）
+        # 5. 更新结构化记忆
         tz  = pytz.timezone(TIMEZONE)
         now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
-
-        # 提取第一行非空内容作为"结论"缓存
         conclusion = next(
             (line.strip() for line in report.splitlines() if line.strip()),
             report[:80]
@@ -288,31 +284,29 @@ ma_trend=均线方向[UP/DOWN/FLAT] | vol_ratio=量比(>1.5为放量) | ATR_14=�
         price_snapshot = {
             sym: data.get("price")
             for sym, data in current_data_dict.items()
-            if isinstance(data, dict) and "price" in data
         }
-        redis.set("marcus_memory", json.dumps({
+        get_redis().set("marcus_memory", json.dumps({
             "time":       now,
             "conclusion": conclusion[:120],
             "report":     report[:600],
             "snapshot":   price_snapshot,
         }, ensure_ascii=False))
 
-        # 6. 发送 Telegram（启用 MarkdownV2）
+        # 6. 发送 Telegram（启用 MarkdownV2，失败时 fallback 纯文本）
         tg_url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
         tg_res = requests.post(
             tg_url,
             json={
                 "chat_id":                  TG_CHAT_ID,
                 "text":                     report,
-                "parse_mode":               "MarkdownV2",   # ← 修复渲染
+                "parse_mode":               "MarkdownV2",
                 "disable_web_page_preview": True,
             },
             timeout=10,
         ).json()
 
-        # Telegram 发送失败时 fallback 纯文本
         if not tg_res.get("ok"):
-            requests.post(
+            fallback = requests.post(
                 tg_url,
                 json={
                     "chat_id":                  TG_CHAT_ID,
@@ -320,7 +314,9 @@ ma_trend=均线方向[UP/DOWN/FLAT] | vol_ratio=量比(>1.5为放量) | ATR_14=�
                     "disable_web_page_preview": True,
                 },
                 timeout=10,
-            )
+            ).json()
+            if not fallback.get("ok"):
+                log.error("Telegram 发送彻底失败: %s", fallback)
 
         return f"报告已发送 | {now} | 资产覆盖: {list(current_data_dict.keys())}"
 
@@ -339,17 +335,12 @@ def health_check():
 
 @app.get("/api/trigger-analysis")
 def trigger_analysis(secret: str = ""):
-    if secret != CRON_SECRET:
+    if not hmac.compare_digest(secret, CRON_SECRET):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
         result_msg = MarcusAgent.execute_and_send()
         return {"status": "Success", "detail": result_msg}
-    except Exception as e:
-        # 暴露完整错误链，便于调试
-        import traceback
-        return {
-            "status": "Failed",
-            "error":  str(e),
-            "trace":  traceback.format_exc()[-800:],
-        }
+    except Exception:
+        log.error("trigger_analysis 异常:\n%s", tb.format_exc())
+        return {"status": "Failed", "error": "内部错误，请查看服务端日志。"}
