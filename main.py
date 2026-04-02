@@ -23,7 +23,7 @@ UPSTASH_TOKEN  = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 TIMEZONE  = "Asia/Kuala_Lumpur"
 WATCHLIST = ["^GSPC", "CL=F", "GC=F", "NVDA", "AAPL", "^VIX", "BTC-USD"]
 
-GEMINI_MODEL = "gemini-2.0-flash-lite"
+GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
 
 logging.basicConfig(
     level=logging.INFO,
