@@ -364,7 +364,8 @@ def get_chart_data(symbol: str):
         clean_closes = []
         for i, ts in enumerate(timestamps):
             c = closes[i] if i < len(closes) else None
-            o = opens[i]  if i < len(opens)  else c
+            raw_o = opens[i] if i < len(opens) else None
+            o = raw_o if raw_o is not None else c
             h = highs[i]  if i < len(highs)  else c
             l = lows[i]   if i < len(lows)   else c
             v = volumes[i] if i < len(volumes) else 0
