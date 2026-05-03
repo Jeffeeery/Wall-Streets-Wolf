@@ -334,12 +334,16 @@ ma_trend=均线方向[UP/DOWN/FLAT] | vol_ratio=量比(>1.5为放量) | ATR_14=�
 # ==========================================
 @app.get("/api/snapshot")
 def get_snapshot():
-    cached = get_redis().get("marcus_snapshot")
-    if cached:
-        return json.loads(cached)
-    data = QuantDataEngine.fetch_and_calculate(WATCHLIST)
-    get_redis().setex("marcus_snapshot", 300, json.dumps(data, ensure_ascii=False))
-    return data
+    try:
+        cached = get_redis().get("marcus_snapshot")
+        if cached:
+            return json.loads(cached)
+        data = QuantDataEngine.fetch_and_calculate(WATCHLIST)
+        get_redis().setex("marcus_snapshot", 300, json.dumps(data, ensure_ascii=False))
+        return data
+    except Exception:
+        log.error("get_snapshot 异常:\n%s", tb.format_exc())
+        raise HTTPException(status_code=503, detail="Market data temporarily unavailable")
 
 
 @app.get("/")
