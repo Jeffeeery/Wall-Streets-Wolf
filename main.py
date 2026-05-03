@@ -8,6 +8,7 @@ from datetime import datetime
 import pytz
 import requests
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from upstash_redis import Redis
 
 # ==========================================
@@ -32,6 +33,13 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 # 懒加载 Redis，避免模块级 None 初始化崩溃
 _redis: Redis | None = None
@@ -324,6 +332,16 @@ ma_trend=均线方向[UP/DOWN/FLAT] | vol_ratio=量比(>1.5为放量) | ATR_14=�
 # ==========================================
 # 5. API 路由
 # ==========================================
+@app.get("/api/snapshot")
+def get_snapshot():
+    cached = get_redis().get("marcus_snapshot")
+    if cached:
+        return json.loads(cached)
+    data = QuantDataEngine.fetch_and_calculate(WATCHLIST)
+    get_redis().setex("marcus_snapshot", 300, json.dumps(data, ensure_ascii=False))
+    return data
+
+
 @app.get("/")
 def health_check():
     return {
