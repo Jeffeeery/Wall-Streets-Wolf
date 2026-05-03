@@ -9,6 +9,7 @@ import pytz
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from upstash_redis import Redis
 
 # ==========================================
@@ -332,6 +333,43 @@ ma_trend=均线方向[UP/DOWN/FLAT] | vol_ratio=量比(>1.5为放量) | ATR_14=�
 # ==========================================
 # 5. API 路由
 # ==========================================
+class WatchlistBody(BaseModel):
+    symbols: list[str]
+
+
+@app.get("/api/memory")
+def get_memory():
+    try:
+        data = get_redis().get("marcus_memory")
+        return json.loads(data) if data else {"message": "No analysis run yet."}
+    except Exception:
+        log.error("get_memory 异常:\n%s", tb.format_exc())
+        raise HTTPException(status_code=503, detail="Memory unavailable")
+
+
+@app.get("/api/watchlist")
+def get_watchlist():
+    try:
+        saved = get_redis().get("marcus_watchlist")
+        return {"watchlist": json.loads(saved) if saved else WATCHLIST}
+    except Exception:
+        log.error("get_watchlist 异常:\n%s", tb.format_exc())
+        raise HTTPException(status_code=503, detail="Watchlist unavailable")
+
+
+@app.post("/api/watchlist")
+def update_watchlist(body: WatchlistBody):
+    if not body.symbols:
+        raise HTTPException(status_code=422, detail="symbols list cannot be empty")
+    try:
+        clean = [s.upper().strip() for s in body.symbols[:20]]
+        get_redis().set("marcus_watchlist", json.dumps(clean))
+        return {"watchlist": clean, "saved": True}
+    except Exception:
+        log.error("update_watchlist 异常:\n%s", tb.format_exc())
+        raise HTTPException(status_code=503, detail="Failed to save watchlist")
+
+
 @app.get("/api/chart/{symbol}")
 def get_chart_data(symbol: str):
     try:
