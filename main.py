@@ -332,6 +332,72 @@ ma_trend=均线方向[UP/DOWN/FLAT] | vol_ratio=量比(>1.5为放量) | ATR_14=�
 # ==========================================
 # 5. API 路由
 # ==========================================
+@app.get("/api/chart/{symbol}")
+def get_chart_data(symbol: str):
+    try:
+        watchlist = json.loads(get_redis().get("marcus_watchlist") or "null") or WATCHLIST
+        if symbol not in watchlist:
+            raise HTTPException(status_code=404, detail=f"{symbol} not in watchlist")
+
+        cache_key = f"chart_cache:{symbol}"
+        cached = get_redis().get(cache_key)
+        if cached:
+            return json.loads(cached)
+
+        url = (
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+            f"?range=90d&interval=1d"
+        )
+        res = requests.get(
+            url, headers=QuantDataEngine.HEADERS, timeout=10
+        ).json()
+        result = res["chart"]["result"][0]
+        timestamps = result["timestamp"]
+        quote = result["indicators"]["quote"][0]
+        opens   = quote.get("open",   [None] * len(timestamps))
+        highs   = quote.get("high",   [])
+        lows    = quote.get("low",    [])
+        closes  = quote.get("close",  [])
+        volumes = quote.get("volume", [])
+
+        candles = []
+        clean_closes = []
+        for i, ts in enumerate(timestamps):
+            c = closes[i] if i < len(closes) else None
+            o = opens[i]  if i < len(opens)  else c
+            h = highs[i]  if i < len(highs)  else c
+            l = lows[i]   if i < len(lows)   else c
+            v = volumes[i] if i < len(volumes) else 0
+            if None in (c, o, h, l):
+                continue
+            candles.append({
+                "time":   ts,
+                "open":   round(float(o), 4),
+                "high":   round(float(h), 4),
+                "low":    round(float(l), 4),
+                "close":  round(float(c), 4),
+                "volume": int(v or 0),
+            })
+            clean_closes.append(float(c))
+
+        rsi_series = []
+        for i in range(len(candles)):
+            if i < 14:
+                continue
+            rsi_val = calculate_rsi(clean_closes[: i + 1])
+            rsi_series.append({"time": candles[i]["time"], "value": rsi_val})
+
+        payload = {"symbol": symbol, "candles": candles, "rsi": rsi_series}
+        get_redis().setex(cache_key, 600, json.dumps(payload))
+        return payload
+
+    except HTTPException:
+        raise
+    except Exception:
+        log.error("get_chart_data 异常 [%s]:\n%s", symbol, tb.format_exc())
+        raise HTTPException(status_code=502, detail="Upstream data fetch failed")
+
+
 @app.get("/api/snapshot")
 def get_snapshot():
     try:
