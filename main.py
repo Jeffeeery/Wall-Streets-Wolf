@@ -8,6 +8,8 @@ from datetime import datetime
 import pytz
 import requests
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from upstash_redis import Redis
 
 # ==========================================
@@ -32,6 +34,13 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 # 懒加载 Redis，避免模块级 None 初始化崩溃
 _redis: Redis | None = None
@@ -324,6 +333,124 @@ ma_trend=均线方向[UP/DOWN/FLAT] | vol_ratio=量比(>1.5为放量) | ATR_14=�
 # ==========================================
 # 5. API 路由
 # ==========================================
+class WatchlistBody(BaseModel):
+    symbols: list[str]
+
+
+@app.get("/api/memory")
+def get_memory():
+    try:
+        data = get_redis().get("marcus_memory")
+        return json.loads(data) if data else {"message": "No analysis run yet."}
+    except Exception:
+        log.error("get_memory 异常:\n%s", tb.format_exc())
+        raise HTTPException(status_code=503, detail="Memory unavailable")
+
+
+@app.get("/api/watchlist")
+def get_watchlist():
+    try:
+        saved = get_redis().get("marcus_watchlist")
+        return {"watchlist": json.loads(saved) if saved else WATCHLIST}
+    except Exception:
+        log.error("get_watchlist 异常:\n%s", tb.format_exc())
+        raise HTTPException(status_code=503, detail="Watchlist unavailable")
+
+
+@app.post("/api/watchlist")
+def update_watchlist(body: WatchlistBody):
+    if not body.symbols:
+        raise HTTPException(status_code=422, detail="symbols list cannot be empty")
+    try:
+        clean = [s.upper().strip() for s in body.symbols[:20]]
+        get_redis().set("marcus_watchlist", json.dumps(clean))
+        return {"watchlist": clean, "saved": True}
+    except Exception:
+        log.error("update_watchlist 异常:\n%s", tb.format_exc())
+        raise HTTPException(status_code=503, detail="Failed to save watchlist")
+
+
+@app.get("/api/chart/{symbol}")
+def get_chart_data(symbol: str):
+    try:
+        watchlist = json.loads(get_redis().get("marcus_watchlist") or "null") or WATCHLIST
+        if symbol not in watchlist:
+            raise HTTPException(status_code=404, detail=f"{symbol} not in watchlist")
+
+        cache_key = f"chart_cache:{symbol}"
+        cached = get_redis().get(cache_key)
+        if cached:
+            return json.loads(cached)
+
+        url = (
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+            f"?range=90d&interval=1d"
+        )
+        res = requests.get(
+            url, headers=QuantDataEngine.HEADERS, timeout=10
+        ).json()
+        result = res["chart"]["result"][0]
+        timestamps = result["timestamp"]
+        quote = result["indicators"]["quote"][0]
+        opens   = quote.get("open",   [None] * len(timestamps))
+        highs   = quote.get("high",   [])
+        lows    = quote.get("low",    [])
+        closes  = quote.get("close",  [])
+        volumes = quote.get("volume", [])
+
+        candles = []
+        clean_closes = []
+        for i, ts in enumerate(timestamps):
+            c = closes[i] if i < len(closes) else None
+            raw_o = opens[i] if i < len(opens) else None
+            o = raw_o if raw_o is not None else c
+            h = highs[i]  if i < len(highs)  else c
+            l = lows[i]   if i < len(lows)   else c
+            v = volumes[i] if i < len(volumes) else 0
+            if None in (c, o, h, l):
+                continue
+            candles.append({
+                "time":   ts,
+                "open":   round(float(o), 4),
+                "high":   round(float(h), 4),
+                "low":    round(float(l), 4),
+                "close":  round(float(c), 4),
+                "volume": int(v or 0),
+            })
+            clean_closes.append(float(c))
+
+        rsi_series = []
+        for i in range(len(candles)):
+            if i < 14:
+                continue
+            rsi_val = calculate_rsi(clean_closes[: i + 1])
+            rsi_series.append({"time": candles[i]["time"], "value": rsi_val})
+
+        payload = {"symbol": symbol, "candles": candles, "rsi": rsi_series}
+        get_redis().setex(cache_key, 600, json.dumps(payload))
+        return payload
+
+    except HTTPException:
+        raise
+    except Exception:
+        log.error("get_chart_data 异常 [%s]:\n%s", symbol, tb.format_exc())
+        raise HTTPException(status_code=502, detail="Upstream data fetch failed")
+
+
+@app.get("/api/snapshot")
+def get_snapshot():
+    try:
+        cached = get_redis().get("marcus_snapshot")
+        if cached:
+            return json.loads(cached)
+        data = QuantDataEngine.fetch_and_calculate(WATCHLIST)
+        get_redis().setex("marcus_snapshot", 300, json.dumps(data, ensure_ascii=False))
+        return data
+    except Exception:
+        log.error("get_snapshot 异常:\n%s", tb.format_exc())
+        raise HTTPException(status_code=503, detail="Market data temporarily unavailable")
+
+
 @app.get("/")
 def health_check():
     return {
