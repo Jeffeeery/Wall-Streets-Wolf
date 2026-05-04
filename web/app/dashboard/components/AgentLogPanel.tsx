@@ -49,7 +49,7 @@ export default function AgentLogPanel() {
                 <p className="text-xs text-gray-500 mb-1 uppercase tracking-wider">
                   Full Report
                 </p>
-                <div className="bg-[#0a0e17] rounded p-3 text-xs text-gray-300 font-mono leading-relaxed max-h-48 overflow-y-auto whitespace-pre-wrap">
+                <div className="bg-[#0a0e17] rounded p-3 text-xs text-gray-300 font-mono leading-relaxed whitespace-pre-wrap">
                   {data.report}
                 </div>
               </div>

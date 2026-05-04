@@ -297,7 +297,7 @@ ma_trend=均线方向[UP/DOWN/FLAT] | vol_ratio=量比(>1.5为放量) | ATR_14=�
         get_redis().set("marcus_memory", json.dumps({
             "time":       now,
             "conclusion": conclusion[:120],
-            "report":     report[:600],
+            "report":     report,
             "snapshot":   price_snapshot,
         }, ensure_ascii=False))
 
