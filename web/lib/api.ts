@@ -3,6 +3,7 @@ import type {
   ChartData,
   MarcusMemory,
   WatchlistResponse,
+  HistoryResponse,
 } from "./types";
 
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
@@ -21,6 +22,9 @@ export const fetchChartData = (symbol: string) =>
 export const fetchMemory = () => get<MarcusMemory>("/api/memory");
 
 export const fetchWatchlist = () => get<WatchlistResponse>("/api/watchlist");
+
+export const fetchHistory = (limit = 30) =>
+  get<HistoryResponse>(`/api/history?limit=${limit}`);
 
 export async function saveWatchlist(symbols: string[]): Promise<void> {
   const res = await fetch(`${BASE}/api/watchlist`, {

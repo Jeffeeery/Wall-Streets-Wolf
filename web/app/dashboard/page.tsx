@@ -2,6 +2,7 @@ import MarketGrid from "./components/MarketGrid";
 import CandleChart from "./components/CandleChart";
 import AgentLogPanel from "./components/AgentLogPanel";
 import WatchlistEditor from "./components/WatchlistEditor";
+import HistoryPanel from "./components/HistoryPanel";
 
 export const dynamic = "force-dynamic";
 
@@ -26,6 +27,13 @@ export default function DashboardPage() {
 
       <section>
         <WatchlistEditor />
+      </section>
+
+      <section>
+        <h2 className="text-xs text-gray-500 uppercase tracking-widest mb-3">
+          Analysis History · Last 30 runs
+        </h2>
+        <HistoryPanel />
       </section>
     </div>
   );

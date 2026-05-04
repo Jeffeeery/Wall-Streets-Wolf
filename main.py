@@ -21,6 +21,8 @@ TG_CHAT_ID     = os.environ.get("TG_CHAT_ID")
 CRON_SECRET    = os.environ.get("CRON_SECRET", "")
 UPSTASH_URL    = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN  = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+SUPABASE_URL   = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY   = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
 TIMEZONE  = "Asia/Kuala_Lumpur"
 WATCHLIST = ["^GSPC", "CL=F", "GC=F", "NVDA", "AAPL", "^VIX", "BTC-USD"]
@@ -50,6 +52,50 @@ def get_redis() -> Redis:
     if _redis is None:
         _redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
     return _redis
+
+
+_SB_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=minimal",
+}
+
+def sb_insert(row: dict) -> None:
+    """Insert one row into analysis_history. Silently logs on failure."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        log.warning("Supabase env vars not set — skipping history insert")
+        return
+    try:
+        res = requests.post(
+            f"{SUPABASE_URL}/rest/v1/analysis_history",
+            headers=_SB_HEADERS,
+            json=row,
+            timeout=10,
+        )
+        if res.status_code not in (200, 201):
+            log.warning("Supabase insert failed %s: %s", res.status_code, res.text[:200])
+    except Exception:
+        log.error("Supabase insert error:\n%s", tb.format_exc())
+
+def sb_fetch_history(limit: int = 30) -> list:
+    """Fetch latest N rows from analysis_history."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return []
+    try:
+        res = requests.get(
+            f"{SUPABASE_URL}/rest/v1/analysis_history",
+            headers={**_SB_HEADERS, "Prefer": ""},
+            params={"order": "created_at.desc", "limit": limit},
+            timeout=10,
+        )
+        if res.status_code == 200:
+            return res.json()
+        log.warning("Supabase fetch failed %s: %s", res.status_code, res.text[:200])
+        return []
+    except Exception:
+        log.error("Supabase fetch error:\n%s", tb.format_exc())
+        return []
 
 
 # ==========================================
@@ -294,12 +340,21 @@ ma_trend=均线方向[UP/DOWN/FLAT] | vol_ratio=量比(>1.5为放量) | ATR_14=�
             sym: data.get("price")
             for sym, data in current_data_dict.items()
         }
-        get_redis().set("marcus_memory", json.dumps({
+        memory_payload = {
             "time":       now,
             "conclusion": conclusion[:120],
             "report":     report,
             "snapshot":   price_snapshot,
-        }, ensure_ascii=False))
+        }
+        get_redis().set("marcus_memory", json.dumps(memory_payload, ensure_ascii=False))
+
+        # 5b. 写入 Supabase 历史存档
+        sb_insert({
+            "analysis_time": now,
+            "conclusion":    conclusion[:120],
+            "report":        report,
+            "snapshot":      price_snapshot,
+        })
 
         # 6. 发送 Telegram（启用 MarkdownV2，失败时 fallback 纯文本）
         tg_url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -440,6 +495,16 @@ def get_snapshot():
     except Exception:
         log.error("get_snapshot 异常:\n%s", tb.format_exc())
         raise HTTPException(status_code=503, detail="Market data temporarily unavailable")
+
+
+@app.get("/api/history")
+def get_history(limit: int = 30):
+    try:
+        rows = sb_fetch_history(min(limit, 90))
+        return {"history": rows}
+    except Exception:
+        log.error("get_history 异常:\n%s", tb.format_exc())
+        raise HTTPException(status_code=503, detail="History unavailable")
 
 
 @app.get("/")

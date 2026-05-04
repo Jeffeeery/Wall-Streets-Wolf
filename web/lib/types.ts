@@ -42,3 +42,16 @@ export interface MarcusMemory {
 export interface WatchlistResponse {
   watchlist: string[];
 }
+
+export interface HistoryRecord {
+  id: number;
+  created_at: string;
+  analysis_time: string;
+  conclusion: string;
+  report: string;
+  snapshot: Record<string, number> | null;
+}
+
+export interface HistoryResponse {
+  history: HistoryRecord[];
+}
