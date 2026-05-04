@@ -373,14 +373,10 @@ def update_watchlist(body: WatchlistBody):
 @app.get("/api/chart/{symbol}")
 def get_chart_data(symbol: str):
     try:
+        # watchlist read is the only Redis call here — no caching of chart data
         watchlist = json.loads(get_redis().get("marcus_watchlist") or "null") or WATCHLIST
         if symbol not in watchlist:
             raise HTTPException(status_code=404, detail=f"{symbol} not in watchlist")
-
-        cache_key = f"chart_cache:{symbol}"
-        cached = get_redis().get(cache_key)
-        if cached:
-            return json.loads(cached)
 
         url = (
             f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -426,9 +422,7 @@ def get_chart_data(symbol: str):
             rsi_val = calculate_rsi(clean_closes[: i + 1])
             rsi_series.append({"time": candles[i]["time"], "value": rsi_val})
 
-        payload = {"symbol": symbol, "candles": candles, "rsi": rsi_series}
-        get_redis().setex(cache_key, 600, json.dumps(payload))
-        return payload
+        return {"symbol": symbol, "candles": candles, "rsi": rsi_series}
 
     except HTTPException:
         raise
@@ -440,11 +434,8 @@ def get_chart_data(symbol: str):
 @app.get("/api/snapshot")
 def get_snapshot():
     try:
-        cached = get_redis().get("marcus_snapshot")
-        if cached:
-            return json.loads(cached)
-        data = QuantDataEngine.fetch_and_calculate(WATCHLIST)
-        get_redis().setex("marcus_snapshot", 300, json.dumps(data, ensure_ascii=False))
+        watchlist = json.loads(get_redis().get("marcus_watchlist") or "null") or WATCHLIST
+        data = QuantDataEngine.fetch_and_calculate(watchlist)
         return data
     except Exception:
         log.error("get_snapshot 异常:\n%s", tb.format_exc())
