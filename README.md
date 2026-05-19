@@ -27,7 +27,7 @@ An AI-powered quantitative market analyst that fetches live market data, compute
 
 - **Runtime**: Python 3.11+
 - **Web framework**: FastAPI (deployed on Vercel)
-- **AI model**: Google Gemini (`gemini-3.1-flash-lite-preview`)
+- **AI model**: Google Gemini (`gemini-3.1-flash-lite`)
 - **Memory store**: Upstash Redis
 - **Notifications**: Telegram Bot API
 
