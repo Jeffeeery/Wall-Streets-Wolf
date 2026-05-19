@@ -5,6 +5,7 @@
     { "src": "web/package.json", "use": "@vercel/next" }
   ],
   "routes": [
-    { "src": "/api/(.*)", "dest": "/main.py" }
+    { "src": "/api/(.*)", "dest": "/main.py" },
+    { "src": "/(.*)", "dest": "/web/$1" }
   ]
 }
