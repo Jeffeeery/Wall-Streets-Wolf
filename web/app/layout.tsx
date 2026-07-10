@@ -4,6 +4,9 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Marcus Wolf | Quant Dashboard",
   description: "Real-time market analysis and AI agent monitoring",
+  other: {
+    "strix-verification": "strix-verify-26fc4070fe31e551ebe10807212e458f",
+  },
 };
 
 export default function RootLayout({
