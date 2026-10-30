@@ -176,3 +176,19 @@ def test_trigger_auth(monkeypatch):
     assert client.get("/api/trigger-analysis?secret=s3").json()["status"] == "Success"
     ok = client.get("/api/trigger-analysis", headers={"Authorization": "Bearer s3"})
     assert ok.json()["status"] == "Success"
+
+
+def test_watchlist_validation(monkeypatch):
+    from fastapi.testclient import TestClient
+    redis = FakeRedis()
+    monkeypatch.setattr(main, "get_redis", lambda: redis)
+    client = TestClient(main.app)
+
+    ok = client.post("/api/watchlist", json={"symbols": ["nvda", "^GSPC", "CL=F", "BTC-USD", "0700.HK", "EURUSD=X", "NVDA"]})
+    assert ok.status_code == 200
+    assert ok.json()["watchlist"] == ["NVDA", "^GSPC", "CL=F", "BTC-USD", "0700.HK", "EURUSD=X"]
+
+    for bad in ["IGNORE ALL RULES", "NVDA;DROP", "A" * 20, "^", "=F"]:
+        r = client.post("/api/watchlist", json={"symbols": ["NVDA", bad]})
+        assert r.status_code == 422, bad
+    assert json.loads(redis.store["marcus_watchlist"])[0] == "NVDA"

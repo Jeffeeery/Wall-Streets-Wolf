@@ -30,6 +30,8 @@ SUPABASE_KEY   = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
 TIMEZONE  = "Asia/Kuala_Lumpur"
 WATCHLIST = ["^GSPC", "CL=F", "GC=F", "NVDA", "AAPL", "^VIX", "BTC-USD"]
+# Yahoo Finance 代码：NVDA / ^GSPC / CL=F / BTC-USD / 0700.HK / EURUSD=X
+YAHOO_SYMBOL_RE = re.compile(r"\^?[A-Z0-9][A-Z0-9.\-]{0,14}(=[FX])?")
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
@@ -618,8 +620,11 @@ def get_watchlist():
 def update_watchlist(body: WatchlistBody):
     if not body.symbols:
         raise HTTPException(status_code=422, detail="symbols list cannot be empty")
+    clean = list(dict.fromkeys(s.upper().strip() for s in body.symbols[:20]))
+    invalid = [s for s in clean if not YAHOO_SYMBOL_RE.fullmatch(s)]
+    if invalid:
+        raise HTTPException(status_code=422, detail=f"Invalid Yahoo Finance symbols: {invalid}")
     try:
-        clean = [s.upper().strip() for s in body.symbols[:20]]
         get_redis().set("marcus_watchlist", json.dumps(clean))
         return {"watchlist": clean, "saved": True}
     except Exception:

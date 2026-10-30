@@ -24,8 +24,8 @@ export default function WatchlistEditor() {
       await saveWatchlist(next);
       await mutate();
       setInput("");
-    } catch {
-      setError("Failed to save — check backend connection.");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to save — check backend connection.");
     } finally {
       setSaving(false);
     }
