@@ -31,7 +31,7 @@ SUPABASE_KEY   = os.environ.get("SUPABASE_SERVICE_KEY", "")
 TIMEZONE  = "Asia/Kuala_Lumpur"
 WATCHLIST = ["^GSPC", "CL=F", "GC=F", "NVDA", "AAPL", "^VIX", "BTC-USD"]
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -304,7 +304,7 @@ def call_gemini(user_prompt: str) -> tuple[dict, list[dict]]:
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
         "tools": [{"google_search": {}}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192},
+        "generationConfig": {"maxOutputTokens": 8192},
     }
     res = requests.post(
         gemini_url,

@@ -29,7 +29,7 @@ Marcus is a **news/catalyst analyst** for short-term traders (1–5 trading days
 
 - **Runtime**: Python 3.11+
 - **Web framework**: FastAPI (deployed on Vercel)
-- **AI model**: Google Gemini (`gemini-3.1-flash-lite`)
+- **AI model**: Google Gemini (`gemini-3.8-flash`) with Google Search grounding
 - **Memory store**: Upstash Redis
 - **Notifications**: Telegram Bot API
 
@@ -38,7 +38,7 @@ Marcus is a **news/catalyst analyst** for short-term traders (1–5 trading days
 | Variable                    | Description                          |
 |-----------------------------|--------------------------------------|
 | `GEMINI_API_KEY`            | Google Gemini API key                |
-| `GEMINI_MODEL`              | Optional, defaults to `gemini-3.1-flash-lite-preview` (must support Google Search grounding) |
+| `GEMINI_MODEL`              | Optional, defaults to `gemini-3.8-flash` (must support Google Search grounding) |
 | `TG_TOKEN`                  | Telegram bot token                   |
 | `TG_CHAT_ID`                | Target Telegram chat/channel ID      |
 | `CRON_SECRET`               | Secret token to authenticate cron calls |
