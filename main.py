@@ -11,7 +11,7 @@ from prompts import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
 
 import pytz
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from upstash_redis import Redis
@@ -80,7 +80,7 @@ def sb_insert(row: dict) -> None:
             timeout=10,
         )
         if res.status_code == 400:
-            # 表结构未迁移（缺 sentiment/sources 列）时退回旧字段
+            # 表结构未迁移（缺 sentiment/sources/outlook 列）时退回旧字段
             log.warning("Supabase insert 400, retrying with legacy columns: %s", res.text[:200])
             res = requests.post(
                 f"{SUPABASE_URL}/rest/v1/analysis_history",
@@ -257,7 +257,10 @@ class QuantDataEngine:
 # 4. Marcus Agent：新闻检索 + 简报 + 发送
 # ==========================================
 SENTIMENT_CN  = {"RISK_ON": "偏多 Risk-on", "RISK_OFF": "避险 Risk-off", "MIXED": "分化"}
-IMPACT_ICON   = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}
+DIRECTION_ICON = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}
+DIRECTION_CN   = {"BULLISH": "利好", "BEARISH": "利空", "NEUTRAL": "中性"}
+CONFIDENCE_CN  = {"HIGH": "高", "MEDIUM": "中", "LOW": "低"}
+NO_NEWS        = "无实质消息"
 IMPORTANCE_ICON = {"HIGH": "🔥", "MEDIUM": "•", "LOW": "·"}
 TG_LIMIT      = 4000
 TG_MAX_SOURCES = 6
@@ -319,6 +322,40 @@ def call_gemini(user_prompt: str) -> tuple[dict, list[dict]]:
         raise RuntimeError(f"Gemini 响应无法解析: {e} | {str(res)[:300]}") from e
 
 
+def normalize_outlook(raw: list, symbols: list[str], prev: dict) -> list[dict]:
+    """
+    按 watchlist 顺序整理每个品种的消息面方向：丢弃不在 watchlist 的品种，
+    缺失的补为中性，非法枚举值回落到 NEUTRAL/LOW，并附上上期方向用于标注变化。
+    """
+    by_sym = {}
+    for item in raw or []:
+        sym = str(item.get("symbol", "")).upper().strip()
+        if sym in symbols and sym not in by_sym:
+            by_sym[sym] = item
+
+    out = []
+    for sym in symbols:
+        item = by_sym.get(sym, {})
+        direction  = str(item.get("direction", "")).upper()
+        confidence = str(item.get("confidence", "")).upper()
+        out.append({
+            "symbol":        sym,
+            "direction":     direction if direction in DIRECTION_CN else "NEUTRAL",
+            "confidence":    confidence if confidence in CONFIDENCE_CN else "LOW",
+            "drivers":       item.get("drivers") or NO_NEWS,
+            "explains_move": item.get("explains_move", ""),
+            "prev":          prev.get(sym),
+        })
+    return out
+
+
+def fmt_direction(o: dict) -> str:
+    text = f"{DIRECTION_CN[o['direction']]}（{CONFIDENCE_CN[o['confidence']]}）"
+    if o["prev"] and o["prev"] != o["direction"]:
+        text += f" 🔄 前次{DIRECTION_CN.get(o['prev'], o['prev'])}"
+    return text
+
+
 def format_price_context(market: dict) -> str:
     lines = []
     for sym, d in market.items():
@@ -352,12 +389,20 @@ def render_telegram(now: str, brief: dict | None, sources: list[dict]) -> str:
                 out.append(f"   → {e(n['impact'])}")
         out.append("")
 
-    assets = brief.get("asset_news") or []
-    if assets:
-        out.append("📌 <b>关注品种</b>")
-        for a in assets:
-            icon = IMPACT_ICON.get(a.get("impact"), "⚪")
-            out.append(f"{icon} <b>{e(a.get('symbol', ''))}</b> {e(a.get('summary', ''))}")
+    outlook = brief.get("outlook") or []
+    if outlook:
+        out.append("🧭 <b>消息面方向</b>（1-5 日）")
+        # 中性且无消息、方向也没变的品种合并成一行，节省篇幅
+        quiet = [o for o in outlook
+                 if o["direction"] == "NEUTRAL" and o["drivers"] == NO_NEWS
+                 and o["prev"] in (None, "NEUTRAL")]
+        for o in outlook:
+            if o in quiet:
+                continue
+            out.append(f"{DIRECTION_ICON[o['direction']]} <b>{e(o['symbol'])}</b> {e(fmt_direction(o))}")
+            out.append(f"   {e(o['drivers'])}")
+        if quiet:
+            out.append(f"⚪ {NO_NEWS}：{e(', '.join(o['symbol'] for o in quiet))}")
         out.append("")
 
     upcoming = brief.get("upcoming") or []
@@ -411,11 +456,11 @@ def render_full_report(now: str, brief: dict | None, sources: list[dict]) -> str
             out.append(f"  影响：{n['impact']}")
     out.append("")
 
-    out.append("【关注品种】")
-    for a in brief.get("asset_news") or []:
-        out.append(f"• {a.get('symbol', '')} [{a.get('impact', '')}] {a.get('summary', '')}")
-        if a.get("explains_move"):
-            out.append(f"  与今日涨跌：{a['explains_move']}")
+    out.append("【消息面方向（1-5 日）】")
+    for o in brief.get("outlook") or []:
+        out.append(f"• {o['symbol']} {fmt_direction(o)}：{o['drivers']}")
+        if o["explains_move"]:
+            out.append(f"  与今日涨跌：{o['explains_move']}")
     out.append("")
 
     out.append("【未来 5 日事件】")
@@ -470,15 +515,21 @@ class MarcusAgent:
         now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
 
         # 1. 拉取行情（只用于对照新闻解释涨跌）
-        market = QuantDataEngine.fetch_and_calculate(load_watchlist())
+        watchlist = load_watchlist()
+        market    = QuantDataEngine.fetch_and_calculate(watchlist)
 
-        # 2. 读取上期要点
+        # 2. 读取上期要点和各品种方向
         last_data = get_redis().get("marcus_memory")
         last_mem  = json.loads(last_data) if last_data else None
-        last_brief = (
-            f"{last_mem.get('time', 'N/A')}：{last_mem.get('conclusion', 'N/A')}"
-            if last_mem else "无（首次运行）"
-        )
+        prev_outlook: dict = (last_mem or {}).get("outlook") or {}
+        if last_mem:
+            last_brief = f"{last_mem.get('time', 'N/A')}：{last_mem.get('conclusion', 'N/A')}"
+            if prev_outlook:
+                last_brief += "\n" + " | ".join(
+                    f"{sym} {DIRECTION_CN.get(d, d)}" for sym, d in prev_outlook.items()
+                )
+        else:
+            last_brief = "无（首次运行）"
 
         # 3. Gemini + Google Search 生成消息面简报
         user_prompt = USER_PROMPT_TEMPLATE.format(
@@ -495,6 +546,9 @@ class MarcusAgent:
             log.error("Gemini 调用失败: %s", e)
         if brief and not sources:
             log.warning("本期 Gemini 未返回检索来源，内容可能未经 grounding")
+        if brief:
+            brief["outlook"] = normalize_outlook(brief.get("outlook"), watchlist, prev_outlook)
+        outlook_map = {o["symbol"]: o["direction"] for o in (brief or {}).get("outlook", [])}
 
         # 4. 生成简报 / 完整报告，写入记忆和历史
         tg_text    = render_telegram(now, brief, sources)
@@ -512,6 +566,7 @@ class MarcusAgent:
                 "report":     report,
                 "snapshot":   price_snapshot,
                 "sources":    sources,
+                "outlook":    outlook_map,
             }, ensure_ascii=False))
 
             sb_insert({
@@ -521,6 +576,7 @@ class MarcusAgent:
                 "snapshot":      price_snapshot,
                 "sentiment":     sentiment,
                 "sources":       sources,
+                "outlook":       outlook_map,
             })
 
         # 5. 发送 Telegram
@@ -660,8 +716,10 @@ def health_check():
 
 
 @app.get("/api/trigger-analysis")
-def trigger_analysis(secret: str = ""):
-    if not hmac.compare_digest(secret, CRON_SECRET):
+def trigger_analysis(secret: str = "", authorization: str = Header(default="")):
+    # 支持 ?secret= 和 Vercel Cron 自动附带的 Authorization: Bearer <CRON_SECRET>
+    token = secret or authorization.removeprefix("Bearer ").strip()
+    if not CRON_SECRET or not hmac.compare_digest(token, CRON_SECRET):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:

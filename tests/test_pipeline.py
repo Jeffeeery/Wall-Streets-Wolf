@@ -43,8 +43,11 @@ BRIEF = {
     "changes": "首次运行",
     "market_news": [{"title": "FOMC 按兵不动", "summary": "利率维持", "impact": "NVDA 承压",
                      "importance": "HIGH"}],
-    "asset_news": [{"symbol": "NVDA", "summary": "出口限制传闻", "impact": "BEARISH",
-                    "explains_move": "可以解释"}],
+    "outlook": [
+        {"symbol": "nvda", "direction": "BEARISH", "confidence": "MEDIUM",
+         "drivers": "出口限制传闻", "explains_move": "可以解释"},
+        {"symbol": "TSLA", "direction": "BULLISH", "confidence": "HIGH", "drivers": "不在自选"},
+    ],
     "upcoming": [{"date": "2026-11-03", "event": "AAPL 财报", "affects": "AAPL", "why": "指引"}],
     "watch": ["CPI"],
 }
@@ -103,17 +106,25 @@ def test_full_run(env):
     tg = calls["tg"][0]
     assert tg["parse_mode"] == "HTML"
     text = tg["text"]
-    assert "&lt;鹰派&gt;" in text and "🔴 <b>NVDA</b>" in text and "AAPL 财报" in text
+    assert "&lt;鹰派&gt;" in text and "AAPL 财报" in text
+    assert "🔴 <b>NVDA</b> 利空（中）" in text and "TSLA" not in text
+    assert "⚪ 无实质消息：^GSPC" in text  # 缺失品种补为中性并合并显示
     assert 'href="https://a.example/1?x=1&amp;y=2"' in text and "未经验证" not in text
 
     mem = json.loads(redis.store["marcus_memory"])
     assert mem["sentiment"] == "RISK_OFF" and len(mem["sources"]) == 2
+    assert mem["outlook"] == {"NVDA": "BEARISH", "^GSPC": "NEUTRAL"}
     assert "【未来 5 日事件】" in mem["report"] and "与今日涨跌：可以解释" in mem["report"]
     assert calls["sb"][0]["sources"][1]["title"] == "cnbc.com"
 
-    # 第二次运行会把上期要点带进 prompt
+    # 第二次运行：上期要点和方向带进 prompt，方向变化被标注
+    flipped = dict(BRIEF, outlook=[{"symbol": "NVDA", "direction": "BULLISH",
+                                    "confidence": "LOW", "drivers": "限制传闻被否认"}])
+    calls["gemini_resp"] = gemini_resp(json.dumps(flipped, ensure_ascii=False))
     main.MarcusAgent.execute_and_send()
-    assert "美联储维持利率不变" in calls["gemini"][1]["contents"][0]["parts"][0]["text"]
+    prompt2 = calls["gemini"][1]["contents"][0]["parts"][0]["text"]
+    assert "美联储维持利率不变" in prompt2 and "NVDA 利空" in prompt2
+    assert "🟢 <b>NVDA</b> 利好（低） 🔄 前次利空" in calls["tg"][1]["text"]
 
 
 def test_no_sources_is_flagged(env):
@@ -143,3 +154,25 @@ def test_extract_json_variants():
 def test_snapshot_keeps_rows_without_volume(env):
     data = main.QuantDataEngine.fetch_and_calculate(["NVDA"])
     assert data["NVDA"]["vol_ratio"] is None and data["NVDA"]["ret_5d"] is not None
+
+
+def test_normalize_outlook_defaults():
+    out = main.normalize_outlook(
+        [{"symbol": "NVDA", "direction": "UP", "confidence": "??"}], ["NVDA", "AAPL"], {"AAPL": "BULLISH"})
+    assert out[0]["direction"] == "NEUTRAL" and out[0]["confidence"] == "LOW"
+    assert out[1]["drivers"] == main.NO_NEWS and out[1]["prev"] == "BULLISH"
+
+
+def test_trigger_auth(monkeypatch):
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(main.MarcusAgent, "execute_and_send", staticmethod(lambda: "ok"))
+    client = TestClient(main.app)
+
+    monkeypatch.setattr(main, "CRON_SECRET", "")
+    assert client.get("/api/trigger-analysis").status_code == 401  # 未配置 secret 时拒绝
+
+    monkeypatch.setattr(main, "CRON_SECRET", "s3")
+    assert client.get("/api/trigger-analysis?secret=bad").status_code == 401
+    assert client.get("/api/trigger-analysis?secret=s3").json()["status"] == "Success"
+    ok = client.get("/api/trigger-analysis", headers={"Authorization": "Bearer s3"})
+    assert ok.json()["status"] == "Success"

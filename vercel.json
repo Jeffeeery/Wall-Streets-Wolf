@@ -7,5 +7,9 @@
   "routes": [
     { "src": "/api/(.*)", "dest": "/main.py" },
     { "src": "/(.*)", "dest": "/web/$1" }
+  ],
+  "crons": [
+    { "path": "/api/trigger-analysis", "schedule": "0 23 * * *" },
+    { "path": "/api/trigger-analysis", "schedule": "0 12 * * *" }
   ]
 }

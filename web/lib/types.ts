@@ -39,6 +39,7 @@ export interface MarcusMemory {
   report?: string;
   snapshot?: Record<string, number>;
   sources?: { title: string; uri: string }[];
+  outlook?: Record<string, "BULLISH" | "BEARISH" | "NEUTRAL">;
   message?: string;
 }
 

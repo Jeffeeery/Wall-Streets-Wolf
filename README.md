@@ -7,10 +7,11 @@ An AI-powered quantitative market analyst that fetches live market data, compute
 Marcus is a **news/catalyst analyst** for short-term traders (1–5 trading days). Technical analysis is deliberately out of scope.
 
 1. **Price Context** — Pulls daily bars from Yahoo Finance for the watchlist saved in the dashboard; only price, daily change and 5-day return are passed to the model so it can tie news to moves.
-2. **News Search** — Gemini runs with **Google Search grounding** (no extra API key) and returns a JSON brief: headline, sentiment, changes since last brief, market news, per-asset news, scheduled events for the next 5 trading days, and what to watch.
-3. **Sources** — Cited URLs are read from the grounding metadata. If a run returns no sources, the brief is flagged as unverified.
-4. **Delivery** — A short brief goes to Telegram (HTML parse mode, rendered and escaped by code); the full brief and source list live on the dashboard.
-5. **Memory** — The latest brief is stored in Upstash Redis so the next run can report what changed; each run is archived to Supabase `analysis_history`. A failed run does not overwrite the previous memory.
+2. **News Search** — Gemini runs with **Google Search grounding** (no extra API key) and returns a JSON brief: headline, overall sentiment, changes since last brief, market news, scheduled events for the next 5 trading days, and what to watch.
+3. **News-Driven Direction** — For every watchlist symbol Marcus gives a 1–5 day direction (bullish / bearish / neutral) with confidence and the news behind it. **Direction only — no prices, levels or targets.** Code fills missing symbols as neutral and flags direction changes versus the previous brief.
+4. **Sources** — Cited URLs are read from the grounding metadata. If a run returns no sources, the brief is flagged as unverified.
+5. **Delivery** — A short brief goes to Telegram (HTML parse mode, rendered and escaped by code); the full brief and source list live on the dashboard.
+6. **Memory** — The latest brief and per-symbol directions is stored in Upstash Redis so the next run can report what changed; each run is archived to Supabase `analysis_history`. A failed run does not overwrite the previous memory.
 
 ## Default Watchlist
 
@@ -51,7 +52,7 @@ Marcus is a **news/catalyst analyst** for short-term traders (1–5 trading days
 1. Fork/clone this repo and import it into Vercel.
 2. Set all environment variables above in the Vercel project settings.
 3. Vercel picks up `vercel.json` automatically — no extra configuration needed.
-4. Set up a cron job (e.g. via Vercel Cron or any external scheduler) to call:
+4. `vercel.json` schedules **two runs a day** via Vercel Cron: 23:00 UTC (07:00 Kuala Lumpur, after the US close) and 12:00 UTC (20:00 Kuala Lumpur, before the US open). Vercel sends `Authorization: Bearer <CRON_SECRET>` automatically. If you used an external scheduler before, disable it to avoid duplicate runs; it can still call:
    ```
    GET https://<your-domain>/api/trigger-analysis?secret=<CRON_SECRET>
    ```
@@ -92,7 +93,7 @@ Telegram brief (full version on the dashboard):
 ```
 🎯 Headline [sentiment]
 🌍 Market News       up to 5 items: what happened → which assets, which direction
-📌 Watchlist News    🟢 bullish / 🔴 bearish / ⚪ neutral per asset with real news
+🧭 Direction (1–5d)  🟢 bullish / 🔴 bearish / ⚪ neutral per symbol, confidence, driving news, 🔄 on change
 📅 Next 5 Days       earnings, central banks, data releases
 👀 Watch
 🔗 Sources
