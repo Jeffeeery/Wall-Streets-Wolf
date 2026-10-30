@@ -9,8 +9,18 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        background: "var(--background)",
-        foreground: "var(--foreground)",
+        bg: "var(--bg)",
+        surface: "var(--surface)",
+        "surface-2": "var(--surface-2)",
+        line: "var(--line)",
+        ink: "var(--ink)",
+        muted: "var(--muted)",
+        accent: "var(--accent)",
+        bull: "var(--bull)",
+        "bull-soft": "var(--bull-soft)",
+        bear: "var(--bear)",
+        "bear-soft": "var(--bear-soft)",
+        "neutral-soft": "var(--neutral-soft)",
       },
     },
   },
