@@ -1,7 +1,7 @@
 "use client";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import useSWR from "swr";
-import { CandlestickSeries, ColorType, createChart } from "lightweight-charts";
+import type { Vela as VelaChart, VelaTheme } from "@luxalgo/vela";
 import { fetchChartData, fetchSnapshot } from "@/lib/api";
 import { formatPct, formatPrice, toneOf } from "@/lib/format";
 import { Card } from "./ui";
@@ -10,51 +10,89 @@ function cssVar(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
+/** 用页面的颜色变量生成 Vela 主题，跟随浅色/深色模式 */
+function pageTheme(): VelaTheme {
+  return {
+    background: cssVar("--surface"),
+    textColor: cssVar("--muted"),
+    gridColor: cssVar("--line"),
+    borderColor: cssVar("--line"),
+    upColor: cssVar("--bull"),
+    downColor: cssVar("--bear"),
+    fontFamily: getComputedStyle(document.body).fontFamily,
+  };
+}
+
 export default function PriceChart({ symbol }: { symbol: string | null }) {
   const { data, error, isLoading } = useSWR(symbol ? ["chart", symbol] : null, () => fetchChartData(symbol!), {
     revalidateOnFocus: false,
   });
   const { data: market } = useSWR("snapshot", fetchSnapshot, { refreshInterval: 300_000 });
   const ref = useRef<HTMLDivElement>(null);
+  const [chartError, setChartError] = useState(false);
 
   useEffect(() => {
     if (!data || !ref.current) return;
-    const chart = createChart(ref.current, {
-      autoSize: true,
-      layout: {
-        background: { type: ColorType.Solid, color: "transparent" },
-        textColor: cssVar("--muted"),
-      },
-      grid: { vertLines: { visible: false }, horzLines: { color: cssVar("--line") } },
-      rightPriceScale: { borderVisible: false },
-      timeScale: { borderVisible: false },
-      handleScroll: false,
-      handleScale: false,
-    });
-    const up = cssVar("--bull");
-    const down = cssVar("--bear");
-    chart
-      .addSeries(CandlestickSeries, {
-        upColor: up,
-        downColor: down,
-        wickUpColor: up,
-        wickDownColor: down,
-        borderVisible: false,
+    const el = ref.current;
+    let chart: VelaChart | null = null;
+    let disposed = false;
+    setChartError(false);
+
+    const bars = data.candles.map((c) => ({
+      time: c.time * 1000, // 后端是秒，Vela 要毫秒
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      volume: c.volume,
+    }));
+
+    // Vela 依赖 WebGL/Canvas，只能在浏览器里加载
+    Promise.all([import("@luxalgo/vela"), import("@luxalgo/vela/locales/zh-Hans")])
+      .then(([{ Vela, registerLocale }, { default: zhHans }]) => {
+        if (disposed) return;
+        registerLocale(zhHans);
+        const theme = pageTheme();
+        chart = new Vela(el, {
+          data: bars,
+          timeframe: "D",
+          theme,
+          upColor: theme.upColor,
+          downColor: theme.downColor,
+          locale: "zh-Hans",
+          drawings: false,
+          volume: bars.some((b) => b.volume > 0),
+          animations: { intro: false },
+        });
       })
-      .setData(
-        data.candles.map((c) => ({
-          time: c.time as unknown as string,
-          open: c.open,
-          high: c.high,
-          low: c.low,
-          close: c.close,
-        }))
-      );
-    chart.timeScale().fitContent();
-    return () => chart.remove();
+      .catch((e) => {
+        console.error("Vela 初始化失败", e);
+        if (!disposed) setChartError(true);
+      });
+
+    // 跟随系统深浅色切换
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const onScheme = () => chart?.setTheme(pageTheme());
+    media.addEventListener("change", onScheme);
+    const resizeObs = new ResizeObserver(() => chart?.resize());
+    resizeObs.observe(el);
+
+    return () => {
+      disposed = true;
+      media.removeEventListener("change", onScheme);
+      resizeObs.disconnect();
+      chart?.destroy();
+    };
   }, [data]);
 
   const d = symbol ? market?.[symbol] : undefined;
+  const overlay = !symbol
+    ? "在自选里选一个品种"
+    : error || chartError
+      ? "走势图加载失败"
+      : isLoading
+        ? "加载中…"
+        : null;
 
   return (
     <Card className="p-4">
@@ -67,15 +105,13 @@ export default function PriceChart({ symbol }: { symbol: string | null }) {
           {formatPrice(d?.price)} <span className={toneOf(d?.pct_change)}>{formatPct(d?.pct_change)}</span>
         </div>
       </div>
-      <div className="relative h-64">
+      <div className="relative h-72 overflow-hidden rounded-lg">
         <div ref={ref} className="absolute inset-0" />
-        {(isLoading || error || !symbol) && (
-          <p className="absolute inset-0 flex items-center justify-center text-sm text-muted">
-            {!symbol ? "在自选里选一个品种" : error ? "走势图加载失败" : "加载中…"}
-          </p>
+        {overlay && (
+          <p className="absolute inset-0 flex items-center justify-center bg-surface text-sm text-muted">{overlay}</p>
         )}
       </div>
-      <p className="mt-1 text-xs text-muted">近 90 个交易日 · 日线</p>
+      <p className="mt-1 text-xs text-muted">近 90 个交易日 · 日线 · 可拖动和缩放</p>
     </Card>
   );
 }
