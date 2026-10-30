@@ -19,6 +19,6 @@ CREATE POLICY "anon_read" ON analysis_history
 CREATE POLICY "service_insert" ON analysis_history
   FOR INSERT TO service_role WITH CHECK (true);
 
--- v3 短线信号：已有表执行这两行即可（未执行时后端会自动退回旧字段写入）
-ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS regime  TEXT;
-ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS signals JSONB;
+-- v3 消息面简报：已有表执行这两行即可（未执行时后端会自动退回旧字段写入）
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS sentiment TEXT;
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS sources   JSONB;

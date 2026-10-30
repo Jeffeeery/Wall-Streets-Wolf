@@ -1,6 +1,8 @@
-"""端到端：mock 掉 Yahoo / Gemini / Redis / Telegram / Supabase，跑一遍完整流程。"""
+"""端到端：mock 掉 Yahoo / Gemini / Redis / Telegram / Supabase，跑一遍消息面简报流程。"""
 import json
 import math
+
+import pytest
 
 import main
 
@@ -24,75 +26,120 @@ class Resp:
         return self._data
 
 
-def yahoo_payload(n, step, base):
-    ts = [1_700_000_000 + i * step for i in range(n)]
+def yahoo_payload(n=250, base=100):
     closes = [base + 5 * math.sin(i / 7) + i * 0.05 for i in range(n)]
     return {"chart": {"result": [{
-        "meta": {"currentTradingPeriod": {"regular": {"start": 0, "end": 1}}},
-        "timestamp": ts,
+        "timestamp": [1_700_000_000 + i * 86400 for i in range(n)],
         "indicators": {"quote": [{
-            "open": closes, "close": closes,
-            "high": [c + 1 for c in closes], "low": [c - 1 for c in closes],
-            "volume": [1000] * n,
+            "close": closes, "high": [c + 1 for c in closes], "low": [c - 1 for c in closes],
+            "volume": [None] * n,  # 指数类无成交量，不应被整行丢弃
         }]},
     }]}}
 
 
-def test_full_run(monkeypatch):
+BRIEF = {
+    "headline": "美联储维持利率不变 <鹰派>",
+    "sentiment": "RISK_OFF",
+    "changes": "首次运行",
+    "market_news": [{"title": "FOMC 按兵不动", "summary": "利率维持", "impact": "NVDA 承压",
+                     "importance": "HIGH"}],
+    "asset_news": [{"symbol": "NVDA", "summary": "出口限制传闻", "impact": "BEARISH",
+                    "explains_move": "可以解释"}],
+    "upcoming": [{"date": "2026-11-03", "event": "AAPL 财报", "affects": "AAPL", "why": "指引"}],
+    "watch": ["CPI"],
+}
+
+
+def gemini_resp(text, chunks=True):
+    cand = {"content": {"parts": [{"text": text}]}}
+    if chunks:
+        cand["groundingMetadata"] = {"groundingChunks": [
+            {"web": {"uri": "https://a.example/1?x=1&y=2", "title": "reuters.com"}},
+            {"web": {"uri": "https://a.example/1?x=1&y=2", "title": "dup"}},
+            {"web": {"uri": "https://b.example/2", "title": "cnbc.com"}},
+        ]}
+    return Resp({"candidates": [cand]})
+
+
+@pytest.fixture
+def env(monkeypatch):
     redis = FakeRedis()
-    redis.store["marcus_watchlist"] = json.dumps(["NVDA", "AAPL"])
+    redis.store["marcus_watchlist"] = json.dumps(["NVDA", "^GSPC"])
     monkeypatch.setattr(main, "get_redis", lambda: redis)
-    sent, inserted = [], []
+    monkeypatch.setattr(main, "SUPABASE_URL", "http://sb")
+    monkeypatch.setattr(main, "SUPABASE_KEY", "k")
+    calls = {"tg": [], "sb": [], "gemini": [], "gemini_resp": None}
 
     def fake_get(url, **kw):
-        assert "AAPL" in url or "NVDA" in url
-        return Resp(yahoo_payload(400, 3600, 100) if "interval=1h" in url else yahoo_payload(250, 86400, 100))
+        return Resp(yahoo_payload())
 
     def fake_post(url, json=None, **kw):
         if "generativelanguage" in url:
-            price = main.QuantDataEngine.fetch_and_calculate(["NVDA"])["NVDA"]["price"]
-            body = {
-                "conclusion": "NVDA 回踩 S1 做多", "regime": "MIXED",
-                "assets": [{"symbol": "NVDA", "bias": "LONG", "note": "RSI_14=55", "levels": "S1"}],
-                "signals": [
-                    {"symbol": "NVDA", "direction": "LONG", "entry": price, "stop": price - 1.5,
-                     "target": price + 4, "horizon_days": 3, "confidence": "HIGH", "rationale": "<test>"},
-                    {"symbol": "AAPL", "direction": "LONG", "entry": 1, "stop": 2, "target": 3,
-                     "horizon_days": 3, "confidence": "LOW", "rationale": "bad"},
-                ],
-                "review": "首次运行", "risk": "数据有限",
-            }
-            return Resp({"candidates": [{"content": {"parts": [{"text": __import__("json").dumps(body)}]}}]})
+            calls["gemini"].append(json)
+            return calls["gemini_resp"]
         if "telegram" in url:
-            sent.append(json)
+            calls["tg"].append(json)
             return Resp({"ok": True})
-        inserted.append(json)
+        calls["sb"].append(json)
         return Resp({}, 201)
 
     monkeypatch.setattr(main.requests, "get", fake_get)
     monkeypatch.setattr(main.requests, "post", fake_post)
-    monkeypatch.setattr(main, "SUPABASE_URL", "http://sb")
-    monkeypatch.setattr(main, "SUPABASE_KEY", "k")
+    return redis, calls
+
+
+def test_full_run(env):
+    redis, calls = env
+    calls["gemini_resp"] = gemini_resp("好的，结果如下：\n```json\n" + json.dumps(BRIEF, ensure_ascii=False) + "\n```")
 
     msg = main.MarcusAgent.execute_and_send()
-    assert "新信号 1" in msg and "剔除 1" in msg
+    assert "来源 2 条" in msg and "OK" in msg
 
-    signals = json.loads(redis.store["marcus_signals"])
-    assert len(signals) == 1 and signals[0]["symbol"] == "NVDA" and signals[0]["status"] == "PENDING"
+    payload = calls["gemini"][0]
+    assert payload["tools"] == [{"google_search": {}}]
+    prompt = payload["contents"][0]["parts"][0]["text"]
+    assert "NVDA:" in prompt and "^GSPC:" in prompt and "首次运行" in prompt
 
-    brief = sent[0]["text"]
-    assert sent[0]["parse_mode"] == "HTML" and "&lt;test&gt;" in brief and "风控剔除 1" in brief
+    tg = calls["tg"][0]
+    assert tg["parse_mode"] == "HTML"
+    text = tg["text"]
+    assert "&lt;鹰派&gt;" in text and "🔴 <b>NVDA</b>" in text and "AAPL 财报" in text
+    assert 'href="https://a.example/1?x=1&amp;y=2"' in text and "未经验证" not in text
 
     mem = json.loads(redis.store["marcus_memory"])
-    assert "【风控剔除】" in mem["report"] and mem["stats"]["open"] == 1
-    assert inserted[0]["signals"][0]["symbol"] == "NVDA"
+    assert mem["sentiment"] == "RISK_OFF" and len(mem["sources"]) == 2
+    assert "【未来 5 日事件】" in mem["report"] and "与今日涨跌：可以解释" in mem["report"]
+    assert calls["sb"][0]["sources"][1]["title"] == "cnbc.com"
 
-    # 第二次运行：已有进行中信号的品种不再重复开仓，且信号被结算推进
+    # 第二次运行会把上期要点带进 prompt
     main.MarcusAgent.execute_and_send()
-    signals = json.loads(redis.store["marcus_signals"])
-    assert len(signals) == 1
+    assert "美联储维持利率不变" in calls["gemini"][1]["contents"][0]["parts"][0]["text"]
 
-    # API
-    from fastapi.testclient import TestClient
-    r = TestClient(main.app).get("/api/signals").json()
-    assert r["stats"]["open"] + r["stats"]["closed"] + r["stats"]["not_triggered"] == 1
+
+def test_no_sources_is_flagged(env):
+    redis, calls = env
+    calls["gemini_resp"] = gemini_resp(json.dumps(BRIEF), chunks=False)
+    main.MarcusAgent.execute_and_send()
+    assert "未经验证" in calls["tg"][0]["text"]
+
+
+def test_gemini_failure_keeps_last_memory(env):
+    redis, calls = env
+    redis.store["marcus_memory"] = json.dumps({"time": "t", "conclusion": "上期"})
+    calls["gemini_resp"] = Resp({"error": {"code": 400, "message": "bad"}})
+    msg = main.MarcusAgent.execute_and_send()
+    assert "引擎异常" in msg and "引擎异常" in calls["tg"][0]["text"]
+    assert json.loads(redis.store["marcus_memory"])["conclusion"] == "上期"
+    assert calls["sb"] == []
+
+
+def test_extract_json_variants():
+    assert main.extract_json('{"a": 1}') == {"a": 1}
+    assert main.extract_json('前言 {"a": {"b": 2}} 后记') == {"a": {"b": 2}}
+    with pytest.raises(ValueError):
+        main.extract_json("no json here")
+
+
+def test_snapshot_keeps_rows_without_volume(env):
+    data = main.QuantDataEngine.fetch_and_calculate(["NVDA"])
+    assert data["NVDA"]["vol_ratio"] is None and data["NVDA"]["ret_5d"] is not None

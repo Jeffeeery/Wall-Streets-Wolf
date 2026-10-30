@@ -7,15 +7,7 @@ import re
 import traceback as tb
 from datetime import datetime
 
-from prompts import RESPONSE_SCHEMA, SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
-from signals import (
-    MAX_SIGNALS_PER_RUN,
-    OPEN_STATUSES,
-    compute_stats,
-    evaluate_signal,
-    new_signal_record,
-    validate_signal,
-)
+from prompts import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
 
 import pytz
 import requests
@@ -39,8 +31,7 @@ SUPABASE_KEY   = os.environ.get("SUPABASE_SERVICE_KEY", "")
 TIMEZONE  = "Asia/Kuala_Lumpur"
 WATCHLIST = ["^GSPC", "CL=F", "GC=F", "NVDA", "AAPL", "^VIX", "BTC-USD"]
 
-GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
-MAX_STORED_SIGNALS = 300
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,7 +80,7 @@ def sb_insert(row: dict) -> None:
             timeout=10,
         )
         if res.status_code == 400:
-            # 表结构未迁移（缺 regime/signals 列）时退回旧字段
+            # 表结构未迁移（缺 sentiment/sources 列）时退回旧字段
             log.warning("Supabase insert 400, retrying with legacy columns: %s", res.text[:200])
             res = requests.post(
                 f"{SUPABASE_URL}/rest/v1/analysis_history",
@@ -178,36 +169,6 @@ def calculate_atr(highs, lows, closes, period: int = 14) -> float:
     return round(atr, 4)
 
 
-def calculate_ema(values: list[float], period: int) -> float | None:
-    if len(values) < period:
-        return None
-    k   = 2 / (period + 1)
-    ema = sum(values[:period]) / period
-    for v in values[period:]:
-        ema = v * k + ema * (1 - k)
-    return ema
-
-
-def classic_pivots(high: float, low: float, close: float) -> dict:
-    p = (high + low + close) / 3
-    return {
-        "pivot": p,
-        "R1":    2 * p - low,
-        "S1":    2 * p - high,
-        "R2":    p + (high - low),
-        "S2":    p - (high - low),
-    }
-
-
-def last_bar_complete(meta: dict, now_ts: int) -> bool:
-    """日线最后一根是否已收盘。盘中（含 24/7 的加密货币）返回 False。"""
-    regular = (meta.get("currentTradingPeriod") or {}).get("regular") or {}
-    start, end = regular.get("start"), regular.get("end")
-    if start is None or end is None:
-        return False
-    return now_ts >= end or now_ts < start
-
-
 # ==========================================
 # 3. 数据引擎：拉取 + 计算
 # ==========================================
@@ -222,206 +183,116 @@ class QuantDataEngine:
     REQUEST_TIMEOUT = 10
 
     @staticmethod
-    def fetch_bars(sym: str, range_: str, interval: str) -> tuple[dict, list[dict]]:
-        """拉取 Yahoo K 线，返回 (meta, bars)。缺 close/high/low 的 K 线被丢弃。"""
-        url = (
-            f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}"
-            f"?range={range_}&interval={interval}"
-        )
-        res = requests.get(
-            url,
-            headers=QuantDataEngine.HEADERS,
-            timeout=QuantDataEngine.REQUEST_TIMEOUT,
-        ).json()
-        result = res["chart"]["result"][0]
-        quote  = result["indicators"]["quote"][0]
-        timestamps = result.get("timestamp") or []
-
-        def col(name):
-            vals = quote.get(name) or []
-            return vals + [None] * (len(timestamps) - len(vals))
-
-        bars = []
-        for ts, o, h, l, c, v in zip(
-            timestamps, col("open"), col("high"), col("low"), col("close"), col("volume")
-        ):
-            if None in (h, l, c):
-                continue
-            bars.append({
-                "time":   ts,
-                "open":   o if o is not None else c,
-                "high":   h,
-                "low":    l,
-                "close":  c,
-                "volume": v or 0,
-            })
-        return result.get("meta") or {}, bars
-
-    @staticmethod
-    def daily_metrics(meta: dict, bars: list[dict], now_ts: int) -> dict | None:
-        if len(bars) < 2:
-            return None
-        closes  = [b["close"]  for b in bars]
-        highs   = [b["high"]   for b in bars]
-        lows    = [b["low"]    for b in bars]
-        volumes = [b["volume"] for b in bars]
-
-        latest, prev = closes[-1], closes[-2]
-        pct_change   = (latest - prev) / prev * 100
-        ret_5d       = (latest - closes[-6]) / closes[-6] * 100 if len(closes) >= 6 else None
-
-        sma200 = sum(closes[-200:]) / min(200, len(closes))
-        sma50  = sum(closes[-50:])  / min(50,  len(closes))
-        sma20  = sum(closes[-20:])  / min(20,  len(closes))
-        atr_14 = calculate_atr(highs, lows, closes)
-
-        # 成交量为 0（指数/VIX 等）时量比无意义
-        avg_vol20 = sum(volumes[-20:]) / min(20, len(volumes))
-        vol_ratio = round(volumes[-1] / avg_vol20, 2) if avg_vol20 and volumes[-1] else None
-
-        # 枢轴价位用上一根已完成的日线
-        ref = bars[-1] if last_bar_complete(meta, now_ts) else bars[-2]
-        pivots = classic_pivots(ref["high"], ref["low"], ref["close"])
-
-        swing_high = max(highs[-20:])
-        swing_low  = min(lows[-20:])
-
-        def r(x):
-            return round(x, 4) if x is not None else None
-
-        return {
-            "price":         round(latest, 2),
-            "pct_change":    round(pct_change, 2),
-            "ret_5d":        round(ret_5d, 2) if ret_5d is not None else None,
-            "RSI_14":        calculate_rsi(closes),
-            "above_MA200":   latest > sma200,
-            "above_MA50":    latest > sma50,
-            "MA20":          r(sma20),
-            "MA50":          r(sma50),
-            "ma_trend":      detect_ma_trend(closes),
-            "vol_ratio":     vol_ratio,
-            "ATR_14":        atr_14,
-            "ATR_pct":       round(atr_14 / latest * 100, 2) if latest else None,
-            **{k: r(v) for k, v in pivots.items()},
-            "swing_high_20": r(swing_high),
-            "swing_low_20":  r(swing_low),
-            "dist_high_atr": round((swing_high - latest) / atr_14, 2) if atr_14 else None,
-            "dist_low_atr":  round((latest - swing_low) / atr_14, 2) if atr_14 else None,
-        }
-
-    @staticmethod
-    def hourly_metrics(bars: list[dict]) -> dict:
-        closes = [b["close"] for b in bars]
-        ema20  = calculate_ema(closes, 20)
-        ema50  = calculate_ema(closes, 50)
-        trend  = "FLAT"
-        if ema20 is not None and ema50 is not None and ema50:
-            diff = (ema20 - ema50) / ema50 * 100
-            trend = "UP" if diff > 0.15 else "DOWN" if diff < -0.15 else "FLAT"
-        return {
-            "h1_trend": trend,
-            "h1_rsi":   calculate_rsi(closes) if len(closes) > 15 else None,
-            "h1_ema20": round(ema20, 4) if ema20 is not None else None,
-        }
-
-    @staticmethod
-    def fetch_full(
-        symbols: list[str], intraday: bool = False, extra_hourly: list[str] = ()
-    ) -> tuple[dict, dict]:
-        """
-        返回 (market_state, hourly_bars)。
-        intraday=True 时额外拉取 1 个月小时线（用于 h1 指标和信号结算）；
-        extra_hourly 是只需要小时线、不在 watchlist 里的品种（有未结算信号）。
-        """
-        now_ts = int(datetime.now(pytz.utc).timestamp())
+    def fetch_and_calculate(symbols: list[str]) -> dict:
         market_state: dict[str, dict] = {}
-        hourly: dict[str, list[dict]] = {}
 
         for sym in symbols:
             try:
-                meta, bars = QuantDataEngine.fetch_bars(sym, "250d", "1d")
-                metrics = QuantDataEngine.daily_metrics(meta, bars, now_ts)
-                if metrics is None:
+                url = (
+                    f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}"
+                    f"?range=250d&interval=1d"
+                )
+                res = requests.get(
+                    url,
+                    headers=QuantDataEngine.HEADERS,
+                    timeout=QuantDataEngine.REQUEST_TIMEOUT,
+                ).json()
+
+                result = res["chart"]["result"][0]
+                quote  = result["indicators"]["quote"][0]
+
+                # 成交量缺失（指数/外汇等）时按 0 处理，不丢弃整根 K 线
+                raw_rows = zip(
+                    quote.get("close",  []),
+                    quote.get("high",   []),
+                    quote.get("low",    []),
+                    quote.get("volume", []),
+                )
+                clean = [
+                    (c, h, l, v or 0)
+                    for c, h, l, v in raw_rows
+                    if None not in (c, h, l)
+                ]
+                if len(clean) < 2:
                     continue
-                market_state[sym] = metrics
+
+                closes  = [r[0] for r in clean]
+                highs   = [r[1] for r in clean]
+                lows    = [r[2] for r in clean]
+                volumes = [r[3] for r in clean]
+
+                latest, prev = closes[-1], closes[-2]
+                pct_change   = (latest - prev) / prev * 100
+                ret_5d = (latest - closes[-6]) / closes[-6] * 100 if len(closes) >= 6 else None
+
+                sma200   = sum(closes[-200:]) / min(200, len(closes))
+                sma50    = sum(closes[-50:])  / min(50,  len(closes))
+                rsi_14   = calculate_rsi(closes)
+                ma_trend = detect_ma_trend(closes)
+                atr_14   = calculate_atr(highs, lows, closes)
+
+                # 成交量为 0 时量比无意义
+                avg_vol20 = sum(volumes[-20:]) / min(20, len(volumes))
+                vol_ratio = round(volumes[-1] / avg_vol20, 2) if avg_vol20 and volumes[-1] else None
+
+                market_state[sym] = {
+                    "price":       round(latest, 2),
+                    "pct_change":  round(pct_change, 2),
+                    "ret_5d":      round(ret_5d, 2) if ret_5d is not None else None,
+                    "RSI_14":      rsi_14,
+                    "above_MA200": latest > sma200,
+                    "above_MA50":  latest > sma50,
+                    "ma_trend":    ma_trend,
+                    "vol_ratio":   vol_ratio,
+                    "ATR_14":      atr_14,
+                }
+
             except Exception as e:
                 log.warning("[QuantDataEngine] 跳过 %s: %s", sym, e)
 
-        if intraday:
-            for sym in list(market_state) + [s for s in extra_hourly if s not in market_state]:
-                try:
-                    _, h1 = QuantDataEngine.fetch_bars(sym, "1mo", "1h")
-                    hourly[sym] = h1
-                    if sym in market_state:
-                        market_state[sym].update(QuantDataEngine.hourly_metrics(h1))
-                except Exception as e:
-                    log.warning("[QuantDataEngine] 小时线失败 %s: %s", sym, e)
-
-        return market_state, hourly
-
-    @staticmethod
-    def fetch_and_calculate(symbols: list[str]) -> dict:
-        return QuantDataEngine.fetch_full(symbols)[0]
+        return market_state
 
 
 # ==========================================
-# 4. Marcus Agent：分析 + 结算 + 发送
+# 4. Marcus Agent：新闻检索 + 简报 + 发送
 # ==========================================
-DIRECTION_CN  = {"LONG": "做多", "SHORT": "做空"}
-CONFIDENCE_CN = {"HIGH": "高", "MEDIUM": "中", "LOW": "低"}
-STATUS_CN = {
-    "PENDING":       "⏳ 待触发",
-    "OPEN":          "🔵 持仓中",
-    "WIN":           "✅ 止盈",
-    "LOSS":          "❌ 止损",
-    "EXPIRED":       "⌛ 到期平仓",
-    "NOT_TRIGGERED": "⚪ 未触发",
-}
-TG_LIMIT = 4000
+SENTIMENT_CN  = {"RISK_ON": "偏多 Risk-on", "RISK_OFF": "避险 Risk-off", "MIXED": "分化"}
+IMPACT_ICON   = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}
+IMPORTANCE_ICON = {"HIGH": "🔥", "MEDIUM": "•", "LOW": "·"}
+TG_LIMIT      = 4000
+TG_MAX_SOURCES = 6
 
 
 def load_watchlist() -> list[str]:
     return json.loads(get_redis().get("marcus_watchlist") or "null") or WATCHLIST
 
 
-def load_signals() -> list[dict]:
-    raw = get_redis().get("marcus_signals")
-    return json.loads(raw) if raw else []
+def extract_json(text: str) -> dict:
+    """从模型输出中取出 JSON 对象（兼容 ```json 代码块和前后多余文字）。"""
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
+    if fenced:
+        text = fenced.group(1)
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError("响应中没有 JSON 对象")
+    return json.loads(text[start:end + 1])
 
 
-def save_signals(signals: list[dict]) -> None:
-    get_redis().set("marcus_signals", json.dumps(signals[-MAX_STORED_SIGNALS:], ensure_ascii=False))
+def extract_sources(candidate: dict) -> list[dict]:
+    """grounding 元数据中的检索来源，按出现顺序去重。"""
+    chunks = (candidate.get("groundingMetadata") or {}).get("groundingChunks") or []
+    sources, seen = [], set()
+    for ch in chunks:
+        web = ch.get("web") or {}
+        uri = web.get("uri")
+        if uri and uri not in seen:
+            seen.add(uri)
+            sources.append({"title": web.get("title") or uri, "uri": uri})
+    return sources
 
 
-def fmt_signal(s: dict) -> str:
-    return (
-        f"{s['symbol']} {DIRECTION_CN[s['direction']]} | 入场 {s['entry']:g} | "
-        f"止损 {s['stop']:g} | 目标 {s['target']:g} | R:R {s['rr']} | "
-        f"{s['horizon_days']}天 | 置信{CONFIDENCE_CN[s['confidence']]}"
-    )
-
-
-def fmt_settled(s: dict) -> str:
-    r = f" {s['r_multiple']:+.2f}R" if s.get("r_multiple") is not None else ""
-    return f"{STATUS_CN[s['status']]} {s['symbol']} {DIRECTION_CN[s['direction']]} @ {s['entry']:g}{r}"
-
-
-def fmt_stats(stats: dict) -> str:
-    if not stats["closed"]:
-        return f"暂无已结算信号（进行中 {stats['open']}，未触发 {stats['not_triggered']}）"
-    line = (
-        f"已结算 {stats['closed']} 笔 | 胜率 {stats['win_rate']}% | "
-        f"平均 {stats['avg_r']:+.2f}R | 累计 {stats['total_r']:+.2f}R | "
-        f"进行中 {stats['open']} | 未触发 {stats['not_triggered']}"
-    )
-    parts = [
-        f"{CONFIDENCE_CN[c]}: {v['n']}笔 胜率{v['win_rate']}% {v['avg_r']:+.2f}R"
-        for c, v in stats["by_confidence"].items()
-    ]
-    return line + ("\n按置信度 → " + "；".join(parts) if parts else "")
-
-
-def call_gemini(user_prompt: str) -> dict:
+def call_gemini(user_prompt: str) -> tuple[dict, list[dict]]:
+    """开启 Google Search grounding 调用 Gemini，返回 (简报 JSON, 来源列表)。"""
     gemini_url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -429,109 +300,139 @@ def call_gemini(user_prompt: str) -> dict:
     payload = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": {
-            "temperature":      0.3,
-            "maxOutputTokens":  8192,
-            "responseMimeType": "application/json",
-            "responseSchema":   RESPONSE_SCHEMA,
-        },
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192},
     }
     res = requests.post(
         gemini_url,
         json=payload,
         headers={"Content-Type": "application/json"},
-        timeout=60,
+        timeout=90,
     ).json()
     try:
-        parts = res["candidates"][0]["content"]["parts"]
-        text  = "".join(p.get("text", "") for p in parts if not p.get("thought"))
-        return json.loads(text)
+        candidate = res["candidates"][0]
+        text = "".join(
+            p.get("text", "") for p in candidate["content"]["parts"] if not p.get("thought")
+        )
+        return extract_json(text), extract_sources(candidate)
     except (KeyError, IndexError, ValueError) as e:
         raise RuntimeError(f"Gemini 响应无法解析: {e} | {str(res)[:300]}") from e
 
 
-def render_telegram(now, analysis, new_sigs, settled, open_sigs, stats, rejected) -> str:
+def format_price_context(market: dict) -> str:
+    lines = []
+    for sym, d in market.items():
+        ret_5d = f"{d['ret_5d']:+.2f}%" if d.get("ret_5d") is not None else "N/A"
+        lines.append(f"{sym}: {d['price']}  日涨跌 {d['pct_change']:+.2f}%  5日 {ret_5d}")
+    return "\n".join(lines) or "（行情数据拉取失败）"
+
+
+def render_telegram(now: str, brief: dict | None, sources: list[dict]) -> str:
     e = html.escape
-    out = [f"🐺 <b>Marcus Wolf · 短线简报</b>  <code>{e(now)}</code>", ""]
+    out = [f"🐺 <b>Marcus Wolf · 消息面简报</b>  <code>{e(now)}</code>", ""]
 
-    if analysis:
-        out += [f"🎯 <b>核心结论</b> [{e(analysis.get('regime', ''))}]",
-                e(analysis.get("conclusion", "")), ""]
-    else:
-        out += ["⚠️ <b>分析引擎异常</b>，本期无新信号。以下为信号结算。", ""]
+    if not brief:
+        out.append("⚠️ <b>新闻检索引擎异常</b>，本期简报暂不可用，请查看服务端日志。")
+        return "\n".join(out)
 
-    out.append("⚡ <b>本期信号</b>")
-    if new_sigs:
-        for s in new_sigs:
-            out.append(f"• <b>{e(fmt_signal(s))}</b>")
-            out.append(f"  理由：{e(s['rationale'])}")
-            if s["invalidation"]:
-                out.append(f"  作废：{e(s['invalidation'])}")
-    else:
-        out.append("信号不足，观望")
-    if rejected:
-        out.append(f"<i>（代码风控剔除 {len(rejected)} 个不合格信号，详见网页）</i>")
-    out.append("")
+    sentiment = SENTIMENT_CN.get(brief.get("sentiment"), brief.get("sentiment", ""))
+    out += [f"🎯 <b>核心</b> [{e(sentiment)}]", e(brief.get("headline", "")), ""]
 
-    if settled or open_sigs:
-        out.append("📋 <b>信号跟踪</b>")
-        out += [e(fmt_settled(s)) for s in settled]
-        out += [e(fmt_settled(s)) for s in open_sigs]
+    if not sources:
+        out += ["⚠️ <i>本期未检索到来源，以下内容未经验证，请谨慎参考</i>", ""]
+
+    news = brief.get("market_news") or []
+    if news:
+        out.append("🌍 <b>市场要闻</b>")
+        for n in news:
+            icon = IMPORTANCE_ICON.get(n.get("importance"), "•")
+            out.append(f"{icon} <b>{e(n.get('title', ''))}</b>")
+            out.append(f"   {e(n.get('summary', ''))}")
+            if n.get("impact"):
+                out.append(f"   → {e(n['impact'])}")
         out.append("")
 
-    out += ["📈 <b>战绩</b>", e(fmt_stats(stats)), ""]
-
-    if analysis:
-        out.append(f"⚠️ <b>最大不确定因子</b>：{e(analysis.get('risk', ''))}")
+    assets = brief.get("asset_news") or []
+    if assets:
+        out.append("📌 <b>关注品种</b>")
+        for a in assets:
+            icon = IMPACT_ICON.get(a.get("impact"), "⚪")
+            out.append(f"{icon} <b>{e(a.get('symbol', ''))}</b> {e(a.get('summary', ''))}")
         out.append("")
-    out.append("<i>完整分析见 Dashboard</i>")
 
+    upcoming = brief.get("upcoming") or []
+    if upcoming:
+        out.append("📅 <b>未来 5 日事件</b>")
+        for u in upcoming:
+            affects = f"（{e(u['affects'])}）" if u.get("affects") else ""
+            out.append(f"• {e(u.get('date', ''))} {e(u.get('event', ''))}{affects}")
+        out.append("")
+
+    watch = brief.get("watch") or []
+    if watch:
+        out.append("👀 <b>重点留意</b>")
+        out += [f"• {e(w)}" for w in watch]
+        out.append("")
+
+    if sources:
+        links = " | ".join(
+            f'<a href="{e(s["uri"], quote=True)}">{e(s["title"])}</a>'
+            for s in sources[:TG_MAX_SOURCES]
+        )
+        out += [f"🔗 <b>来源</b>：{links}", ""]
+
+    out.append("<i>完整版见 Dashboard</i>")
     msg = "\n".join(out)
-    return msg if len(msg) <= TG_LIMIT else msg[:TG_LIMIT - 20] + "\n…（已截断）"
+    if len(msg) <= TG_LIMIT:
+        return msg
+    # 超长时丢掉来源行，避免截断到 HTML 标签中间
+    msg = "\n".join(line for line in out if not line.startswith("🔗"))
+    return msg if len(msg) <= TG_LIMIT else html.escape(html.unescape(re.sub(r"<[^>]+>", "", msg)))[:TG_LIMIT]
 
 
-def render_full_report(now, analysis, new_sigs, settled, open_sigs, stats, rejected) -> str:
-    out = [f"Marcus Wolf · 短线完整分析 · {now}", ""]
+def render_full_report(now: str, brief: dict | None, sources: list[dict]) -> str:
+    out = [f"Marcus Wolf · 消息面完整简报 · {now}", ""]
+    if not brief:
+        out.append("【新闻检索引擎异常】本期简报暂不可用。")
+        return "\n".join(out)
 
-    if analysis:
-        out += [f"【核心结论】[{analysis.get('regime', '')}]", analysis.get("conclusion", ""), ""]
-        out.append("【逐品种技术面】")
-        for a in analysis.get("assets", []):
-            out.append(f"• {a.get('symbol')} [{a.get('bias')}] {a.get('note', '')}")
-            if a.get("levels"):
-                out.append(f"  关键价位：{a['levels']}")
-        out.append("")
-    else:
-        out += ["【分析引擎异常】本期无新信号。", ""]
+    sentiment = SENTIMENT_CN.get(brief.get("sentiment"), brief.get("sentiment", ""))
+    out += [f"【核心】[{sentiment}]", brief.get("headline", ""), ""]
+    if not sources:
+        out += ["⚠️ 本期未检索到来源，以下内容未经验证。", ""]
+    if brief.get("changes"):
+        out += ["【相比上期】", brief["changes"], ""]
 
-    out.append("【本期信号】")
-    if new_sigs:
-        for s in new_sigs:
-            out.append(f"• {fmt_signal(s)}")
-            out.append(f"  止损 = {s['stop_atr']} ATR | 理由：{s['rationale']}")
-            if s["invalidation"]:
-                out.append(f"  作废条件：{s['invalidation']}")
-    else:
-        out.append("信号不足，观望")
+    out.append("【市场要闻】")
+    for n in brief.get("market_news") or []:
+        out.append(f"• [{n.get('importance', '')}] {n.get('title', '')}")
+        out.append(f"  {n.get('summary', '')}")
+        if n.get("impact"):
+            out.append(f"  影响：{n['impact']}")
     out.append("")
 
-    if rejected:
-        out.append("【风控剔除】")
-        out += [f"• {r}" for r in rejected]
-        out.append("")
-
-    out.append("【信号跟踪】")
-    if settled or open_sigs:
-        out += [f"• {fmt_settled(s)}" for s in settled + open_sigs]
-    else:
-        out.append("无")
+    out.append("【关注品种】")
+    for a in brief.get("asset_news") or []:
+        out.append(f"• {a.get('symbol', '')} [{a.get('impact', '')}] {a.get('summary', '')}")
+        if a.get("explains_move"):
+            out.append(f"  与今日涨跌：{a['explains_move']}")
     out.append("")
 
-    out += ["【战绩】", fmt_stats(stats), ""]
+    out.append("【未来 5 日事件】")
+    for u in brief.get("upcoming") or []:
+        out.append(f"• {u.get('date', '')} {u.get('event', '')} | {u.get('affects', '')}")
+        if u.get("why"):
+            out.append(f"  {u['why']}")
+    out.append("")
 
-    if analysis:
-        out += ["【复盘】", analysis.get("review", ""), "",
-                "【最大不确定因子】", analysis.get("risk", "")]
+    if brief.get("watch"):
+        out.append("【重点留意】")
+        out += [f"• {w}" for w in brief["watch"]]
+        out.append("")
+
+    if sources:
+        out.append("【来源】")
+        out += [f"• {s['title']}: {s['uri']}" for s in sources]
 
     return "\n".join(out)
 
@@ -565,103 +466,71 @@ class MarcusAgent:
 
     @staticmethod
     def execute_and_send() -> str:
-        tz      = pytz.timezone(TIMEZONE)
-        now_dt  = datetime.now(tz)
-        now     = now_dt.strftime("%Y-%m-%d %H:%M")
-        now_ts  = int(now_dt.timestamp())
+        tz  = pytz.timezone(TIMEZONE)
+        now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
 
-        # 1. 读取 watchlist 和历史信号，拉取日线 + 小时线
-        watchlist  = load_watchlist()
-        signals    = load_signals()
-        open_syms  = sorted({s["symbol"] for s in signals if s["status"] in OPEN_STATUSES})
-        market, hourly = QuantDataEngine.fetch_full(watchlist, intraday=True, extra_hourly=open_syms)
+        # 1. 拉取行情（只用于对照新闻解释涨跌）
+        market = QuantDataEngine.fetch_and_calculate(load_watchlist())
 
-        # 2. 用小时线客观结算未完成的信号
-        settled: list[dict] = []
-        for i, s in enumerate(signals):
-            if s["status"] not in OPEN_STATUSES or s["symbol"] not in hourly:
-                continue
-            updated = evaluate_signal(s, hourly[s["symbol"]], now_ts)
-            if updated["status"] not in OPEN_STATUSES:
-                settled.append(updated)
-            signals[i] = updated
-        open_sigs = [s for s in signals if s["status"] in OPEN_STATUSES]
-        stats     = compute_stats(signals)
-
-        # 3. 构造 Prompt
-        signal_review = "\n".join(
-            [f"本期结算：{fmt_settled(s)}" for s in settled]
-            + [f"进行中：{fmt_settled(s)}（{fmt_signal(s)}）" for s in open_sigs]
-        ) or "无"
-        user_prompt = USER_PROMPT_TEMPLATE.format(
-            current_data=json.dumps(market, indent=2, ensure_ascii=False),
-            track_record=fmt_stats(stats),
-            signal_review=signal_review,
+        # 2. 读取上期要点
+        last_data = get_redis().get("marcus_memory")
+        last_mem  = json.loads(last_data) if last_data else None
+        last_brief = (
+            f"{last_mem.get('time', 'N/A')}：{last_mem.get('conclusion', 'N/A')}"
+            if last_mem else "无（首次运行）"
         )
 
-        # 4. 调用 Gemini → 代码风控校验信号
-        analysis: dict | None = None
+        # 3. Gemini + Google Search 生成消息面简报
+        user_prompt = USER_PROMPT_TEMPLATE.format(
+            now=now,
+            timezone=TIMEZONE,
+            price_context=format_price_context(market),
+            last_brief=last_brief,
+        )
+        brief: dict | None = None
+        sources: list[dict] = []
         try:
-            analysis = call_gemini(user_prompt)
+            brief, sources = call_gemini(user_prompt)
         except Exception as e:
             log.error("Gemini 调用失败: %s", e)
+        if brief and not sources:
+            log.warning("本期 Gemini 未返回检索来源，内容可能未经 grounding")
 
-        new_sigs: list[dict] = []
-        rejected: list[str]  = []
-        busy = {s["symbol"] for s in open_sigs}
-        for raw in (analysis or {}).get("signals", []):
-            sig, reason = validate_signal(raw, market)
-            if sig is None:
-                rejected.append(reason)
-            elif sig["symbol"] in busy:
-                rejected.append(f"{sig['symbol']}: 已有进行中信号")
-            elif len(new_sigs) >= MAX_SIGNALS_PER_RUN:
-                rejected.append(f"{sig['symbol']}: 超过每期 {MAX_SIGNALS_PER_RUN} 个上限")
-            else:
-                busy.add(sig["symbol"])
-                new_sigs.append(new_signal_record(sig, now_dt))
-        if rejected:
-            log.info("风控剔除信号: %s", rejected)
-
-        signals += new_sigs
-        save_signals(signals)
-        stats = compute_stats(signals)
-
-        # 5. 生成简报 / 完整报告，写入记忆和历史
-        args     = (now, analysis, new_sigs, settled, open_sigs, stats, rejected)
-        brief    = render_telegram(*args)
-        report   = render_full_report(*args)
-        conclusion = (analysis or {}).get("conclusion") or "分析引擎异常，本期无新信号"
+        # 4. 生成简报 / 完整报告，写入记忆和历史
+        tg_text    = render_telegram(now, brief, sources)
+        report     = render_full_report(now, brief, sources)
+        conclusion = (brief or {}).get("headline") or "新闻检索引擎异常，本期无简报"
+        sentiment  = (brief or {}).get("sentiment")
         price_snapshot = {sym: d.get("price") for sym, d in market.items()}
 
-        memory_payload = {
-            "time":       now,
-            "conclusion": conclusion[:200],
-            "regime":     (analysis or {}).get("regime"),
-            "report":     report,
-            "brief":      brief,
-            "snapshot":   price_snapshot,
-            "signals":    new_sigs,
-            "stats":      stats,
-        }
-        get_redis().set("marcus_memory", json.dumps(memory_payload, ensure_ascii=False))
+        if brief:
+            # 失败时不覆盖上期记忆，保证下期仍能对比
+            get_redis().set("marcus_memory", json.dumps({
+                "time":       now,
+                "conclusion": conclusion[:200],
+                "sentiment":  sentiment,
+                "report":     report,
+                "snapshot":   price_snapshot,
+                "sources":    sources,
+            }, ensure_ascii=False))
 
-        sb_insert({
-            "analysis_time": now,
-            "conclusion":    conclusion[:200],
-            "report":        report,
-            "snapshot":      price_snapshot,
-            "regime":        memory_payload["regime"],
-            "signals":       new_sigs,
-        })
+            sb_insert({
+                "analysis_time": now,
+                "conclusion":    conclusion[:200],
+                "report":        report,
+                "snapshot":      price_snapshot,
+                "sentiment":     sentiment,
+                "sources":       sources,
+            })
 
-        # 6. 发送 Telegram
-        send_telegram(brief)
+        # 5. 发送 Telegram
+        send_telegram(tg_text)
 
         return (
             f"报告已发送 | {now} | 资产覆盖: {list(market.keys())} | "
-            f"新信号 {len(new_sigs)} | 结算 {len(settled)} | 剔除 {len(rejected)}"
+            f"来源 {len(sources)} 条 | {'OK' if brief else '引擎异常'}"
         )
+
 
 # ==========================================
 # 5. API 路由
@@ -769,19 +638,6 @@ def get_snapshot():
     except Exception:
         log.error("get_snapshot 异常:\n%s", tb.format_exc())
         raise HTTPException(status_code=503, detail="Market data temporarily unavailable")
-
-
-@app.get("/api/signals")
-def get_signals(limit: int = 50):
-    try:
-        signals = load_signals()
-        return {
-            "signals": list(reversed(signals))[: min(limit, MAX_STORED_SIGNALS)],
-            "stats":   compute_stats(signals),
-        }
-    except Exception:
-        log.error("get_signals 异常:\n%s", tb.format_exc())
-        raise HTTPException(status_code=503, detail="Signals unavailable")
 
 
 @app.get("/api/history")
