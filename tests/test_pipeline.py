@@ -45,7 +45,7 @@ def yahoo_payload(n=250, base=100):
 def tavily_results(query):
     if "Federal Reserve" in query:
         return [
-            {"title": "Fed holds rates", "url": "https://a.example/1?x=1&y=2",
+            {"title": "Fed holds <!-- --> rates", "url": "https://a.example/1?x=1&y=2",
              "content": "The Fed held rates.", "published_date": "2026-10-30"},
             {"title": "dup", "url": "https://a.example/1?x=1&y=2", "content": "dup"},
         ]
@@ -120,10 +120,14 @@ def test_full_run(env):
     msg = main.MarcusAgent.execute_and_send()
     assert "检索 2 条 / 引用 2 条" in msg and main.GEMINI_MODEL in msg
 
-    # Tavily：3 条宏观 + 每个品种 1 条，只搜新闻、最近一天
-    assert len(calls["tavily"]) == 5
-    assert all(q["topic"] == "news" and q["time_range"] == "day" for q in calls["tavily"])
-    queries = [q["query"] for q in calls["tavily"]]
+    # Tavily：4 条宏观 + 每个品种 1 条，先限定主流媒体，搜不到再放开
+    first = [q for q in calls["tavily"] if q.get("include_domains")]
+    retry = [q for q in calls["tavily"] if not q.get("include_domains")]
+    assert len(first) == 6 and all(q["topic"] == "news" for q in first)
+    assert "reuters.com" in first[0]["include_domains"]
+    assert len(retry) == 4  # 只有返回空结果的主题才重试（宏观 3 条 + ^GSPC）
+    assert {q["time_range"] for q in first if "calendar" in q["query"] or "earnings" in q["query"]} == {"week"}
+    queries = [q["query"] for q in first]
     assert any("NVIDIA Corporation (NVDA)" in q for q in queries) and any("S&P 500" in q for q in queries)
 
     # Gemini：不带搜索工具，结构化输出，检索结果带编号进入 prompt
@@ -144,6 +148,7 @@ def test_full_run(env):
     mem = json.loads(redis.store["marcus_memory"])
     assert mem["sentiment"] == "RISK_OFF" and [s["id"] for s in mem["sources"]] == ["S1", "S2"]
     assert mem["outlook"] == {"NVDA": "BEARISH", "^GSPC": "NEUTRAL"}
+    assert mem["brief"]["outlook"][0]["links"][0]["domain"] == "b.example"  # 结构化简报供 Dashboard 使用
     assert "FOMC 按兵不动 [S1]" in mem["report"] and "[S2] NVDA export curbs: https://b.example/2" in mem["report"]
     assert calls["sb"][0]["sources"][1]["uri"] == "https://b.example/2"
 
@@ -177,7 +182,7 @@ def test_gemini_failure_keeps_last_memory(env):
 
 def test_no_news_skips_gemini(env, monkeypatch):
     redis, calls = env
-    monkeypatch.setattr(main, "tavily_search", lambda q: [])
+    monkeypatch.setattr(main, "tavily_search", lambda q, t="day": [])
     msg = main.MarcusAgent.execute_and_send()
     assert "新闻检索失败" in msg and calls["gemini"] == [] and "新闻检索失败" in calls["tg"][0]["text"]
 
@@ -214,6 +219,17 @@ def test_normalize_outlook_defaults():
     assert out[0]["direction"] == "NEUTRAL" and out[0]["confidence"] == "LOW"
     assert out[1]["drivers"] == main.NO_NEWS and out[1]["prev"] == "BULLISH"
     assert out[2]["direction"] == "BEARISH"  # 有来源的判断保留
+    assert out[2]["confidence"] == "MEDIUM"  # 只有一个来源网站，「高」降为「中」
+
+    two = main.normalize_outlook(
+        [{"symbol": "X", "direction": "BULLISH", "confidence": "HIGH", "drivers": "d",
+          "links": [{"domain": "reuters.com"}, {"domain": "cnbc.com"}]}], ["X"], {})
+    assert two[0]["confidence"] == "HIGH"
+
+
+def test_clean_title_and_price_precision(env):
+    assert main.clean_title("Nvidia <!-- --> slips  <b>now</b>") == "Nvidia slips now"
+    assert main.domain_of("https://www.reuters.com/x") == "reuters.com"
 
 
 def test_trigger_auth(monkeypatch):

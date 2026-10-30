@@ -23,3 +23,4 @@ CREATE POLICY "service_insert" ON analysis_history
 ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS sentiment TEXT;
 ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS sources   JSONB;
 ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS outlook   JSONB;
+ALTER TABLE analysis_history ADD COLUMN IF NOT EXISTS brief     JSONB;

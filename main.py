@@ -7,6 +7,7 @@ import re
 import traceback as tb
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from urllib.parse import urlparse
 
 from prompts import RESPONSE_SCHEMA, SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
 
@@ -85,7 +86,7 @@ def sb_insert(row: dict) -> None:
             timeout=10,
         )
         if res.status_code == 400:
-            # 表结构未迁移（缺 sentiment/sources/outlook 列）时退回旧字段
+            # 表结构未迁移（缺 sentiment/sources/outlook/brief 列）时退回旧字段
             log.warning("Supabase insert 400, retrying with legacy columns: %s", res.text[:200])
             res = requests.post(
                 f"{SUPABASE_URL}/rest/v1/analysis_history",
@@ -243,7 +244,8 @@ class QuantDataEngine:
                 meta = result.get("meta") or {}
                 market_state[sym] = {
                     "name":        meta.get("shortName") or meta.get("longName"),
-                    "price":       round(latest, 2),
+                    # 外汇等低价品种保留 4 位小数，否则看不出波动
+                    "price":       round(latest, 2 if abs(latest) >= 10 else 4),
                     "pct_change":  round(pct_change, 2),
                     "ret_5d":      round(ret_5d, 2) if ret_5d is not None else None,
                     "RSI_14":      rsi_14,
@@ -271,11 +273,20 @@ NO_NEWS        = "无实质消息"
 IMPORTANCE_ICON = {"HIGH": "🔥", "MEDIUM": "•", "LOW": "·"}
 TG_LIMIT      = 4000
 
-# 每期固定的宏观检索主题；品种检索按 watchlist 动态生成
+# 每期固定的宏观检索主题 (标签, 关键词, 时间范围)；品种检索按 watchlist 动态生成
 MACRO_QUERIES = [
-    ("宏观/央行", "stock market news today Federal Reserve inflation economy"),
-    ("地缘/大宗", "geopolitics oil gold markets news today"),
-    ("事件日历", "this week earnings calendar economic data FOMC CPI jobs report"),
+    ("宏观/央行", "stock market news today Federal Reserve inflation economy", "day"),
+    ("地缘/大宗", "geopolitics oil gold markets news today", "day"),
+    # 日历类预告通常在周初发布，放宽到一周
+    ("财报日历", "major company earnings reports this week what to expect", "week"),
+    ("经济日历", "economic calendar this week Fed CPI jobs report GDP", "week"),
+]
+# 优先只检索主流财经媒体；某个主题在白名单内搜不到时再放开
+TRUSTED_DOMAINS = [
+    "reuters.com", "bloomberg.com", "cnbc.com", "wsj.com", "ft.com", "apnews.com",
+    "bbc.com", "cnn.com", "marketwatch.com", "barrons.com", "finance.yahoo.com",
+    "investing.com", "fxstreet.com", "coindesk.com", "theblock.co", "kitco.com",
+    "economist.com", "axios.com", "nikkei.com", "scmp.com",
 ]
 # Yahoo 代码 → 检索关键词（期货/指数/外汇的代码本身搜不到新闻）
 SEARCH_ALIASES = {
@@ -302,34 +313,50 @@ def search_term(sym: str, market: dict) -> str:
     return f"{name} ({sym}) stock" if name else f"{sym} stock"
 
 
-def build_queries(watchlist: list[str], market: dict) -> list[tuple[str, str]]:
-    return MACRO_QUERIES + [(sym, f"{search_term(sym, market)} news") for sym in watchlist]
+def build_queries(watchlist: list[str], market: dict) -> list[tuple[str, str, str]]:
+    return MACRO_QUERIES + [(sym, f"{search_term(sym, market)} news", "day") for sym in watchlist]
 
 
-def tavily_search(query: str) -> list[dict]:
-    res = requests.post(
-        "https://api.tavily.com/search",
-        headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
-        json={
+def tavily_search(query: str, time_range: str = "day") -> list[dict]:
+    def search(domains: list[str] | None) -> list[dict]:
+        body = {
             "query":        query,
             "topic":        "news",
-            "time_range":   "day",
+            "time_range":   time_range,
             "search_depth": "basic",
             "max_results":  TAVILY_MAX_RESULTS,
-        },
-        timeout=15,
-    )
-    res.raise_for_status()
-    return res.json().get("results") or []
+        }
+        if domains:
+            body["include_domains"] = domains
+        res = requests.post(
+            "https://api.tavily.com/search",
+            headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
+            json=body,
+            timeout=15,
+        )
+        res.raise_for_status()
+        return res.json().get("results") or []
+
+    return search(TRUSTED_DOMAINS) or search(None)
 
 
-def collect_news(queries: list[tuple[str, str]]) -> list[dict]:
+def clean_title(title: str) -> str:
+    """去掉标题里混入的 HTML 注释/标签和多余空白。"""
+    return re.sub(r"\s+", " ", re.sub(r"<!--.*?-->|<[^>]+>", "", title)).strip()
+
+
+def domain_of(url: str) -> str:
+    host = urlparse(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def collect_news(queries: list[tuple[str, str, str]]) -> list[dict]:
     """并行检索，按 URL 去重并编号 S1..Sn。单个检索失败不影响其他检索。"""
     with ThreadPoolExecutor(max_workers=6) as pool:
         results = list(pool.map(lambda q: _safe_search(*q), queries))
 
     sources, seen = [], set()
-    for (label, _), items in zip(queries, results):
+    for (label, _, _), items in zip(queries, results):
         for r in items:
             url = r.get("url")
             if not url or url in seen:
@@ -338,7 +365,7 @@ def collect_news(queries: list[tuple[str, str]]) -> list[dict]:
             sources.append({
                 "id":        f"S{len(sources) + 1}",
                 "topic":     label,
-                "title":     (r.get("title") or url).strip(),
+                "title":     clean_title(r.get("title") or url),
                 "uri":       url,
                 "published": r.get("published_date") or "",
                 "content":   (r.get("content") or "").strip()[:NEWS_CONTENT_CHARS],
@@ -346,9 +373,9 @@ def collect_news(queries: list[tuple[str, str]]) -> list[dict]:
     return sources
 
 
-def _safe_search(label: str, query: str) -> list[dict]:
+def _safe_search(label: str, query: str, time_range: str) -> list[dict]:
     try:
-        return tavily_search(query)
+        return tavily_search(query, time_range)
     except Exception as e:
         log.warning("Tavily 检索失败 [%s]: %s", label, e)
         return []
@@ -425,7 +452,8 @@ def resolve_citations(brief: dict, sources: list[dict]) -> list[dict]:
         for sid in item.get("sources") or []:
             s = by_id.get(str(sid).strip().strip("[]"))
             if s and s["id"] not in {x["id"] for x in out}:
-                out.append({"id": s["id"], "title": s["title"], "uri": s["uri"]})
+                out.append({"id": s["id"], "title": s["title"], "uri": s["uri"],
+                            "domain": domain_of(s["uri"])})
                 cited[s["id"]] = out[-1]
         return out
 
@@ -447,7 +475,7 @@ def normalize_outlook(raw: list, symbols: list[str], prev: dict) -> list[dict]:
     """
     按 watchlist 顺序整理每个品种的消息面方向：丢弃不在 watchlist 的品种，
     缺失的补为中性，非法枚举值回落到 NEUTRAL/LOW，没有有效来源的利好/利空降为中性，
-    并附上上期方向用于标注变化。
+    「高」置信度至少需要两个不同网站的来源，否则降为「中」，并附上上期方向用于标注变化。
     """
     by_sym = {}
     for item in raw or []:
@@ -464,6 +492,8 @@ def normalize_outlook(raw: list, symbols: list[str], prev: dict) -> list[dict]:
         drivers    = item.get("drivers") or NO_NEWS
         if direction not in DIRECTION_CN or (direction != "NEUTRAL" and not links):
             direction, confidence, drivers = "NEUTRAL", "LOW", NO_NEWS
+        if confidence == "HIGH" and len({l.get("domain") for l in links}) < 2:
+            confidence = "MEDIUM"
         out.append({
             "symbol":        sym,
             "direction":     direction,
@@ -700,6 +730,7 @@ class MarcusAgent:
                 "snapshot":   price_snapshot,
                 "sources":    sources,
                 "outlook":    outlook_map,
+                "brief":      brief,
             }, ensure_ascii=False))
 
             sb_insert({
@@ -710,6 +741,7 @@ class MarcusAgent:
                 "sentiment":     sentiment,
                 "sources":       sources,
                 "outlook":       outlook_map,
+                "brief":         brief,
             })
 
         # 6. 发送 Telegram
