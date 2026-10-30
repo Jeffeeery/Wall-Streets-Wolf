@@ -6,6 +6,7 @@ import os
 import re
 import time
 import traceback as tb
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from urllib.parse import urlparse
@@ -468,6 +469,15 @@ def call_gemini(user_prompt: str) -> dict:
     raise LLMError("服务过载（503）")
 
 
+def opencode_headers() -> dict:
+    # OpenCode Go 要求每个请求带会话 ID，否则返回 400 MissingSessionID；每次运行一个新 ID
+    return {
+        "Authorization":      f"Bearer {OPENCODE_API_KEY}",
+        "Content-Type":       "application/json",
+        "x-opencode-session": f"marcus-{uuid.uuid4().hex}",
+    }
+
+
 def call_opencode(user_prompt: str) -> dict:
     if not OPENCODE_API_KEY:
         raise LLMError("未配置 OPENCODE_API_KEY")
@@ -479,7 +489,7 @@ def call_opencode(user_prompt: str) -> dict:
 def _opencode_google(user_prompt: str) -> dict:
     """OpenCode Go 上的 Gemini 模型走 Google 原生 generateContent，可用 responseSchema 和思考等级。"""
     payload = gemini_payload(user_prompt, OPENCODE_EFFORT or None)
-    headers = {"Authorization": f"Bearer {OPENCODE_API_KEY}", "Content-Type": "application/json"}
+    headers = opencode_headers()
     resp = None
     for base in dict.fromkeys(OPENCODE_GOOGLE_BASES):
         try:
@@ -519,7 +529,7 @@ def _opencode_openai(user_prompt: str) -> dict:
     try:
         resp = requests.post(
             f"{OPENCODE_OPENAI_BASE.rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {OPENCODE_API_KEY}"},
+            headers=opencode_headers(),
             json=body,
             timeout=OPENCODE_TIMEOUT,
         )
