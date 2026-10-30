@@ -1,11 +1,12 @@
 export interface SymbolSnapshot {
   price: number;
   pct_change: number;
+  ret_5d?: number | null;
   RSI_14: number;
   above_MA200: boolean;
   above_MA50: boolean;
   ma_trend: "UP" | "DOWN" | "FLAT";
-  vol_ratio: number;
+  vol_ratio: number | null;
   ATR_14: number;
 }
 
@@ -34,8 +35,11 @@ export interface ChartData {
 export interface MarcusMemory {
   time?: string;
   conclusion?: string;
+  sentiment?: string | null;
   report?: string;
   snapshot?: Record<string, number>;
+  sources?: { title: string; uri: string }[];
+  outlook?: Record<string, "BULLISH" | "BEARISH" | "NEUTRAL">;
   message?: string;
 }
 

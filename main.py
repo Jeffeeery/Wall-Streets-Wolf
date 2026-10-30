@@ -1,7 +1,9 @@
 import hmac
+import html
 import json
 import logging
 import os
+import re
 import traceback as tb
 from datetime import datetime
 
@@ -9,7 +11,7 @@ from prompts import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
 
 import pytz
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from upstash_redis import Redis
@@ -28,8 +30,10 @@ SUPABASE_KEY   = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
 TIMEZONE  = "Asia/Kuala_Lumpur"
 WATCHLIST = ["^GSPC", "CL=F", "GC=F", "NVDA", "AAPL", "^VIX", "BTC-USD"]
+# Yahoo Finance 代码：NVDA / ^GSPC / CL=F / BTC-USD / 0700.HK / EURUSD=X
+YAHOO_SYMBOL_RE = re.compile(r"\^?[A-Z0-9][A-Z0-9.\-]{0,14}(=[FX])?")
 
-GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,6 +67,8 @@ _SB_HEADERS = {
     "Prefer": "return=minimal",
 }
 
+_SB_LEGACY_COLUMNS = ("analysis_time", "conclusion", "report", "snapshot")
+
 def sb_insert(row: dict) -> None:
     """Insert one row into analysis_history. Silently logs on failure."""
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -75,6 +81,15 @@ def sb_insert(row: dict) -> None:
             json=row,
             timeout=10,
         )
+        if res.status_code == 400:
+            # 表结构未迁移（缺 sentiment/sources/outlook 列）时退回旧字段
+            log.warning("Supabase insert 400, retrying with legacy columns: %s", res.text[:200])
+            res = requests.post(
+                f"{SUPABASE_URL}/rest/v1/analysis_history",
+                headers=_SB_HEADERS,
+                json={k: row[k] for k in _SB_LEGACY_COLUMNS if k in row},
+                timeout=10,
+            )
         if res.status_code not in (200, 201):
             log.warning("Supabase insert failed %s: %s", res.status_code, res.text[:200])
     except Exception:
@@ -139,19 +154,21 @@ def detect_ma_trend(closes: list[float], fast: int = 20, slow: int = 50) -> str:
 
 
 def calculate_atr(highs, lows, closes, period: int = 14) -> float:
-    """平均真实波幅（ATR），衡量近期波动率。"""
+    """Wilder 平滑 ATR，衡量近期波动率。"""
     if len(closes) < period + 1:
         return 0.0
-    trs = []
-    for i in range(1, len(closes)):
-        tr = max(
+    trs = [
+        max(
             highs[i] - lows[i],
             abs(highs[i] - closes[i - 1]),
             abs(lows[i]  - closes[i - 1]),
         )
-        trs.append(tr)
-    recent = trs[-period:]
-    return round(sum(recent) / len(recent), 4)
+        for i in range(1, len(closes))
+    ]
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return round(atr, 4)
 
 
 # ==========================================
@@ -186,6 +203,7 @@ class QuantDataEngine:
                 result = res["chart"]["result"][0]
                 quote  = result["indicators"]["quote"][0]
 
+                # 成交量缺失（指数/外汇等）时按 0 处理，不丢弃整根 K 线
                 raw_rows = zip(
                     quote.get("close",  []),
                     quote.get("high",   []),
@@ -193,9 +211,9 @@ class QuantDataEngine:
                     quote.get("volume", []),
                 )
                 clean = [
-                    (c, h, l, v)
+                    (c, h, l, v or 0)
                     for c, h, l, v in raw_rows
-                    if None not in (c, h, l, v)
+                    if None not in (c, h, l)
                 ]
                 if len(clean) < 2:
                     continue
@@ -207,6 +225,7 @@ class QuantDataEngine:
 
                 latest, prev = closes[-1], closes[-2]
                 pct_change   = (latest - prev) / prev * 100
+                ret_5d = (latest - closes[-6]) / closes[-6] * 100 if len(closes) >= 6 else None
 
                 sma200   = sum(closes[-200:]) / min(200, len(closes))
                 sma50    = sum(closes[-50:])  / min(50,  len(closes))
@@ -214,12 +233,14 @@ class QuantDataEngine:
                 ma_trend = detect_ma_trend(closes)
                 atr_14   = calculate_atr(highs, lows, closes)
 
+                # 成交量为 0 时量比无意义
                 avg_vol20 = sum(volumes[-20:]) / min(20, len(volumes))
-                vol_ratio = round(volumes[-1] / avg_vol20, 2) if avg_vol20 else 1.0
+                vol_ratio = round(volumes[-1] / avg_vol20, 2) if avg_vol20 and volumes[-1] else None
 
                 market_state[sym] = {
                     "price":       round(latest, 2),
                     "pct_change":  round(pct_change, 2),
+                    "ret_5d":      round(ret_5d, 2) if ret_5d is not None else None,
                     "RSI_14":      rsi_14,
                     "above_MA200": latest > sma200,
                     "above_MA50":  latest > sma50,
@@ -235,113 +256,338 @@ class QuantDataEngine:
 
 
 # ==========================================
-# 4. Marcus Agent：分析 + 发送
+# 4. Marcus Agent：新闻检索 + 简报 + 发送
 # ==========================================
+SENTIMENT_CN  = {"RISK_ON": "偏多 Risk-on", "RISK_OFF": "避险 Risk-off", "MIXED": "分化"}
+DIRECTION_ICON = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}
+DIRECTION_CN   = {"BULLISH": "利好", "BEARISH": "利空", "NEUTRAL": "中性"}
+CONFIDENCE_CN  = {"HIGH": "高", "MEDIUM": "中", "LOW": "低"}
+NO_NEWS        = "无实质消息"
+IMPORTANCE_ICON = {"HIGH": "🔥", "MEDIUM": "•", "LOW": "·"}
+TG_LIMIT      = 4000
+TG_MAX_SOURCES = 6
+
+
+def load_watchlist() -> list[str]:
+    return json.loads(get_redis().get("marcus_watchlist") or "null") or WATCHLIST
+
+
+def extract_json(text: str) -> dict:
+    """从模型输出中取出 JSON 对象（兼容 ```json 代码块和前后多余文字）。"""
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
+    if fenced:
+        text = fenced.group(1)
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError("响应中没有 JSON 对象")
+    return json.loads(text[start:end + 1])
+
+
+def extract_sources(candidate: dict) -> list[dict]:
+    """grounding 元数据中的检索来源，按出现顺序去重。"""
+    chunks = (candidate.get("groundingMetadata") or {}).get("groundingChunks") or []
+    sources, seen = [], set()
+    for ch in chunks:
+        web = ch.get("web") or {}
+        uri = web.get("uri")
+        if uri and uri not in seen:
+            seen.add(uri)
+            sources.append({"title": web.get("title") or uri, "uri": uri})
+    return sources
+
+
+def call_gemini(user_prompt: str) -> tuple[dict, list[dict]]:
+    """开启 Google Search grounding 调用 Gemini，返回 (简报 JSON, 来源列表)。"""
+    gemini_url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"maxOutputTokens": 8192},
+    }
+    res = requests.post(
+        gemini_url,
+        json=payload,
+        headers={"Content-Type": "application/json"},
+        timeout=90,
+    ).json()
+    try:
+        candidate = res["candidates"][0]
+        text = "".join(
+            p.get("text", "") for p in candidate["content"]["parts"] if not p.get("thought")
+        )
+        return extract_json(text), extract_sources(candidate)
+    except (KeyError, IndexError, ValueError) as e:
+        raise RuntimeError(f"Gemini 响应无法解析: {e} | {str(res)[:300]}") from e
+
+
+def normalize_outlook(raw: list, symbols: list[str], prev: dict) -> list[dict]:
+    """
+    按 watchlist 顺序整理每个品种的消息面方向：丢弃不在 watchlist 的品种，
+    缺失的补为中性，非法枚举值回落到 NEUTRAL/LOW，并附上上期方向用于标注变化。
+    """
+    by_sym = {}
+    for item in raw or []:
+        sym = str(item.get("symbol", "")).upper().strip()
+        if sym in symbols and sym not in by_sym:
+            by_sym[sym] = item
+
+    out = []
+    for sym in symbols:
+        item = by_sym.get(sym, {})
+        direction  = str(item.get("direction", "")).upper()
+        confidence = str(item.get("confidence", "")).upper()
+        out.append({
+            "symbol":        sym,
+            "direction":     direction if direction in DIRECTION_CN else "NEUTRAL",
+            "confidence":    confidence if confidence in CONFIDENCE_CN else "LOW",
+            "drivers":       item.get("drivers") or NO_NEWS,
+            "explains_move": item.get("explains_move", ""),
+            "prev":          prev.get(sym),
+        })
+    return out
+
+
+def fmt_direction(o: dict) -> str:
+    text = f"{DIRECTION_CN[o['direction']]}（{CONFIDENCE_CN[o['confidence']]}）"
+    if o["prev"] and o["prev"] != o["direction"]:
+        text += f" 🔄 前次{DIRECTION_CN.get(o['prev'], o['prev'])}"
+    return text
+
+
+def format_price_context(market: dict) -> str:
+    lines = []
+    for sym, d in market.items():
+        ret_5d = f"{d['ret_5d']:+.2f}%" if d.get("ret_5d") is not None else "N/A"
+        lines.append(f"{sym}: {d['price']}  日涨跌 {d['pct_change']:+.2f}%  5日 {ret_5d}")
+    return "\n".join(lines) or "（行情数据拉取失败）"
+
+
+def render_telegram(now: str, brief: dict | None, sources: list[dict]) -> str:
+    e = html.escape
+    out = [f"🐺 <b>Marcus Wolf · 消息面简报</b>  <code>{e(now)}</code>", ""]
+
+    if not brief:
+        out.append("⚠️ <b>新闻检索引擎异常</b>，本期简报暂不可用，请查看服务端日志。")
+        return "\n".join(out)
+
+    sentiment = SENTIMENT_CN.get(brief.get("sentiment"), brief.get("sentiment", ""))
+    out += [f"🎯 <b>核心</b> [{e(sentiment)}]", e(brief.get("headline", "")), ""]
+
+    if not sources:
+        out += ["⚠️ <i>本期未检索到来源，以下内容未经验证，请谨慎参考</i>", ""]
+
+    news = brief.get("market_news") or []
+    if news:
+        out.append("🌍 <b>市场要闻</b>")
+        for n in news:
+            icon = IMPORTANCE_ICON.get(n.get("importance"), "•")
+            out.append(f"{icon} <b>{e(n.get('title', ''))}</b>")
+            out.append(f"   {e(n.get('summary', ''))}")
+            if n.get("impact"):
+                out.append(f"   → {e(n['impact'])}")
+        out.append("")
+
+    outlook = brief.get("outlook") or []
+    if outlook:
+        out.append("🧭 <b>消息面方向</b>（1-5 日）")
+        # 中性且无消息、方向也没变的品种合并成一行，节省篇幅
+        quiet = [o for o in outlook
+                 if o["direction"] == "NEUTRAL" and o["drivers"] == NO_NEWS
+                 and o["prev"] in (None, "NEUTRAL")]
+        for o in outlook:
+            if o in quiet:
+                continue
+            out.append(f"{DIRECTION_ICON[o['direction']]} <b>{e(o['symbol'])}</b> {e(fmt_direction(o))}")
+            out.append(f"   {e(o['drivers'])}")
+        if quiet:
+            out.append(f"⚪ {NO_NEWS}：{e(', '.join(o['symbol'] for o in quiet))}")
+        out.append("")
+
+    upcoming = brief.get("upcoming") or []
+    if upcoming:
+        out.append("📅 <b>未来 5 日事件</b>")
+        for u in upcoming:
+            affects = f"（{e(u['affects'])}）" if u.get("affects") else ""
+            out.append(f"• {e(u.get('date', ''))} {e(u.get('event', ''))}{affects}")
+        out.append("")
+
+    watch = brief.get("watch") or []
+    if watch:
+        out.append("👀 <b>重点留意</b>")
+        out += [f"• {e(w)}" for w in watch]
+        out.append("")
+
+    if sources:
+        links = " | ".join(
+            f'<a href="{e(s["uri"], quote=True)}">{e(s["title"])}</a>'
+            for s in sources[:TG_MAX_SOURCES]
+        )
+        out += [f"🔗 <b>来源</b>：{links}", ""]
+
+    out.append("<i>完整版见 Dashboard</i>")
+    msg = "\n".join(out)
+    if len(msg) <= TG_LIMIT:
+        return msg
+    # 超长时丢掉来源行，避免截断到 HTML 标签中间
+    msg = "\n".join(line for line in out if not line.startswith("🔗"))
+    return msg if len(msg) <= TG_LIMIT else html.escape(html.unescape(re.sub(r"<[^>]+>", "", msg)))[:TG_LIMIT]
+
+
+def render_full_report(now: str, brief: dict | None, sources: list[dict]) -> str:
+    out = [f"Marcus Wolf · 消息面完整简报 · {now}", ""]
+    if not brief:
+        out.append("【新闻检索引擎异常】本期简报暂不可用。")
+        return "\n".join(out)
+
+    sentiment = SENTIMENT_CN.get(brief.get("sentiment"), brief.get("sentiment", ""))
+    out += [f"【核心】[{sentiment}]", brief.get("headline", ""), ""]
+    if not sources:
+        out += ["⚠️ 本期未检索到来源，以下内容未经验证。", ""]
+    if brief.get("changes"):
+        out += ["【相比上期】", brief["changes"], ""]
+
+    out.append("【市场要闻】")
+    for n in brief.get("market_news") or []:
+        out.append(f"• [{n.get('importance', '')}] {n.get('title', '')}")
+        out.append(f"  {n.get('summary', '')}")
+        if n.get("impact"):
+            out.append(f"  影响：{n['impact']}")
+    out.append("")
+
+    out.append("【消息面方向（1-5 日）】")
+    for o in brief.get("outlook") or []:
+        out.append(f"• {o['symbol']} {fmt_direction(o)}：{o['drivers']}")
+        if o["explains_move"]:
+            out.append(f"  与今日涨跌：{o['explains_move']}")
+    out.append("")
+
+    out.append("【未来 5 日事件】")
+    for u in brief.get("upcoming") or []:
+        out.append(f"• {u.get('date', '')} {u.get('event', '')} | {u.get('affects', '')}")
+        if u.get("why"):
+            out.append(f"  {u['why']}")
+    out.append("")
+
+    if brief.get("watch"):
+        out.append("【重点留意】")
+        out += [f"• {w}" for w in brief["watch"]]
+        out.append("")
+
+    if sources:
+        out.append("【来源】")
+        out += [f"• {s['title']}: {s['uri']}" for s in sources]
+
+    return "\n".join(out)
+
+
+def send_telegram(text: str) -> None:
+    tg_url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    res = requests.post(
+        tg_url,
+        json={
+            "chat_id":                  TG_CHAT_ID,
+            "text":                     text,
+            "parse_mode":               "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=10,
+    ).json()
+    if res.get("ok"):
+        return
+    # HTML 解析失败时去掉标签发纯文本
+    plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+    fallback = requests.post(
+        tg_url,
+        json={"chat_id": TG_CHAT_ID, "text": plain, "disable_web_page_preview": True},
+        timeout=10,
+    ).json()
+    if not fallback.get("ok"):
+        log.error("Telegram 发送彻底失败: %s", fallback)
+
+
 class MarcusAgent:
 
     @staticmethod
     def execute_and_send() -> str:
-        # 1. 拉取量化数据，过滤掉拉取失败的品种
-        raw_data = QuantDataEngine.fetch_and_calculate(WATCHLIST)
-        current_data_dict = {k: v for k, v in raw_data.items() if "error" not in v}
-        current_data_json = json.dumps(current_data_dict, indent=2, ensure_ascii=False)
-
-        # 2. 读取历史记忆
-        last_data = get_redis().get("marcus_memory")
-        last_mem  = json.loads(last_data) if last_data else None
-        if last_mem:
-            history_context = (
-                f"时间：{last_mem.get('time', 'N/A')}\n"
-                f"结论：{last_mem.get('conclusion', 'N/A')}\n"
-                f"摘要：{last_mem.get('report', 'N/A')}"
-            )
-        else:
-            history_context = "无历史记录（首次运行）。"
-
-        # 3. 构造 Prompt
-        user_prompt = USER_PROMPT_TEMPLATE.format(
-            current_data=current_data_json,
-            history_context=history_context,
-        )
-
-        # 4. 调用 Gemini
-        gemini_url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        )
-        payload = {
-            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 1024},
-        }
-
-        gemini_res: dict = {}
-        try:
-            gemini_res = requests.post(
-                gemini_url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=30,
-            ).json()
-            report = gemini_res["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError, requests.RequestException) as e:
-            log.error("Gemini 调用失败: %s | 响应: %s", e, str(gemini_res)[:300])
-            report = "⚠️ *Marcus Wolf 分析引擎异常*\n`分析暂时不可用，请稍后重试。`"
-
-        # 5. 更新结构化记忆
         tz  = pytz.timezone(TIMEZONE)
         now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
-        conclusion = next(
-            (line.strip() for line in report.splitlines() if line.strip()),
-            report[:80]
+
+        # 1. 拉取行情（只用于对照新闻解释涨跌）
+        watchlist = load_watchlist()
+        market    = QuantDataEngine.fetch_and_calculate(watchlist)
+
+        # 2. 读取上期要点和各品种方向
+        last_data = get_redis().get("marcus_memory")
+        last_mem  = json.loads(last_data) if last_data else None
+        prev_outlook: dict = (last_mem or {}).get("outlook") or {}
+        if last_mem:
+            last_brief = f"{last_mem.get('time', 'N/A')}：{last_mem.get('conclusion', 'N/A')}"
+            if prev_outlook:
+                last_brief += "\n" + " | ".join(
+                    f"{sym} {DIRECTION_CN.get(d, d)}" for sym, d in prev_outlook.items()
+                )
+        else:
+            last_brief = "无（首次运行）"
+
+        # 3. Gemini + Google Search 生成消息面简报
+        user_prompt = USER_PROMPT_TEMPLATE.format(
+            now=now,
+            timezone=TIMEZONE,
+            price_context=format_price_context(market),
+            last_brief=last_brief,
         )
-        price_snapshot = {
-            sym: data.get("price")
-            for sym, data in current_data_dict.items()
-        }
-        memory_payload = {
-            "time":       now,
-            "conclusion": conclusion[:120],
-            "report":     report,
-            "snapshot":   price_snapshot,
-        }
-        get_redis().set("marcus_memory", json.dumps(memory_payload, ensure_ascii=False))
+        brief: dict | None = None
+        sources: list[dict] = []
+        try:
+            brief, sources = call_gemini(user_prompt)
+        except Exception as e:
+            log.error("Gemini 调用失败: %s", e)
+        if brief and not sources:
+            log.warning("本期 Gemini 未返回检索来源，内容可能未经 grounding")
+        if brief:
+            brief["outlook"] = normalize_outlook(brief.get("outlook"), watchlist, prev_outlook)
+        outlook_map = {o["symbol"]: o["direction"] for o in (brief or {}).get("outlook", [])}
 
-        # 5b. 写入 Supabase 历史存档
-        sb_insert({
-            "analysis_time": now,
-            "conclusion":    conclusion[:120],
-            "report":        report,
-            "snapshot":      price_snapshot,
-        })
+        # 4. 生成简报 / 完整报告，写入记忆和历史
+        tg_text    = render_telegram(now, brief, sources)
+        report     = render_full_report(now, brief, sources)
+        conclusion = (brief or {}).get("headline") or "新闻检索引擎异常，本期无简报"
+        sentiment  = (brief or {}).get("sentiment")
+        price_snapshot = {sym: d.get("price") for sym, d in market.items()}
 
-        # 6. 发送 Telegram（启用 MarkdownV2，失败时 fallback 纯文本）
-        tg_url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        tg_res = requests.post(
-            tg_url,
-            json={
-                "chat_id":                  TG_CHAT_ID,
-                "text":                     report,
-                "parse_mode":               "MarkdownV2",
-                "disable_web_page_preview": True,
-            },
-            timeout=10,
-        ).json()
+        if brief:
+            # 失败时不覆盖上期记忆，保证下期仍能对比
+            get_redis().set("marcus_memory", json.dumps({
+                "time":       now,
+                "conclusion": conclusion[:200],
+                "sentiment":  sentiment,
+                "report":     report,
+                "snapshot":   price_snapshot,
+                "sources":    sources,
+                "outlook":    outlook_map,
+            }, ensure_ascii=False))
 
-        if not tg_res.get("ok"):
-            fallback = requests.post(
-                tg_url,
-                json={
-                    "chat_id":                  TG_CHAT_ID,
-                    "text":                     report,
-                    "disable_web_page_preview": True,
-                },
-                timeout=10,
-            ).json()
-            if not fallback.get("ok"):
-                log.error("Telegram 发送彻底失败: %s", fallback)
+            sb_insert({
+                "analysis_time": now,
+                "conclusion":    conclusion[:200],
+                "report":        report,
+                "snapshot":      price_snapshot,
+                "sentiment":     sentiment,
+                "sources":       sources,
+                "outlook":       outlook_map,
+            })
 
-        return f"报告已发送 | {now} | 资产覆盖: {list(current_data_dict.keys())}"
+        # 5. 发送 Telegram
+        send_telegram(tg_text)
+
+        return (
+            f"报告已发送 | {now} | 资产覆盖: {list(market.keys())} | "
+            f"来源 {len(sources)} 条 | {'OK' if brief else '引擎异常'}"
+        )
 
 
 # ==========================================
@@ -364,8 +610,7 @@ def get_memory():
 @app.get("/api/watchlist")
 def get_watchlist():
     try:
-        saved = get_redis().get("marcus_watchlist")
-        return {"watchlist": json.loads(saved) if saved else WATCHLIST}
+        return {"watchlist": load_watchlist()}
     except Exception:
         log.error("get_watchlist 异常:\n%s", tb.format_exc())
         raise HTTPException(status_code=503, detail="Watchlist unavailable")
@@ -375,8 +620,11 @@ def get_watchlist():
 def update_watchlist(body: WatchlistBody):
     if not body.symbols:
         raise HTTPException(status_code=422, detail="symbols list cannot be empty")
+    clean = list(dict.fromkeys(s.upper().strip() for s in body.symbols[:20]))
+    invalid = [s for s in clean if not YAHOO_SYMBOL_RE.fullmatch(s)]
+    if invalid:
+        raise HTTPException(status_code=422, detail=f"Invalid Yahoo Finance symbols: {invalid}")
     try:
-        clean = [s.upper().strip() for s in body.symbols[:20]]
         get_redis().set("marcus_watchlist", json.dumps(clean))
         return {"watchlist": clean, "saved": True}
     except Exception:
@@ -388,8 +636,7 @@ def update_watchlist(body: WatchlistBody):
 def get_chart_data(symbol: str):
     try:
         # watchlist read is the only Redis call here — no caching of chart data
-        watchlist = json.loads(get_redis().get("marcus_watchlist") or "null") or WATCHLIST
-        if symbol not in watchlist:
+        if symbol not in load_watchlist():
             raise HTTPException(status_code=404, detail=f"{symbol} not in watchlist")
 
         url = (
@@ -448,9 +695,7 @@ def get_chart_data(symbol: str):
 @app.get("/api/snapshot")
 def get_snapshot():
     try:
-        watchlist = json.loads(get_redis().get("marcus_watchlist") or "null") or WATCHLIST
-        data = QuantDataEngine.fetch_and_calculate(watchlist)
-        return data
+        return QuantDataEngine.fetch_and_calculate(load_watchlist())
     except Exception:
         log.error("get_snapshot 异常:\n%s", tb.format_exc())
         raise HTTPException(status_code=503, detail="Market data temporarily unavailable")
@@ -471,13 +716,15 @@ def health_check():
     return {
         "status":  "Marcus Wolf Online",
         "model":   GEMINI_MODEL,
-        "version": "2.0",
+        "version": "3.0",
     }
 
 
 @app.get("/api/trigger-analysis")
-def trigger_analysis(secret: str = ""):
-    if not hmac.compare_digest(secret, CRON_SECRET):
+def trigger_analysis(secret: str = "", authorization: str = Header(default="")):
+    # 支持 ?secret= 和 Vercel Cron 自动附带的 Authorization: Bearer <CRON_SECRET>
+    token = secret or authorization.removeprefix("Bearer ").strip()
+    if not CRON_SECRET or not hmac.compare_digest(token, CRON_SECRET):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:

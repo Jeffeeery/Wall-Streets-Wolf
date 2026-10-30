@@ -4,12 +4,14 @@ An AI-powered quantitative market analyst that fetches live market data, compute
 
 ## How It Works
 
-1. **Data Fetch** — Pulls up to 250 days of daily OHLCV data from Yahoo Finance for a configurable watchlist.
-2. **Quant Indicators** — Calculates RSI-14, MA-20/50 trend, ATR-14, and 20-day volume ratio for each asset.
-3. **AI Analysis** — Sends the snapshot + last session's memory to Gemini, which responds as *Marcus Wolf*, a cold-and-precise quantitative macro analyst.
-4. **Memory** — Stores the current report summary in Upstash Redis so the next run can compare against it.
-5. **Telegram Delivery** — Posts the formatted report (Telegram MarkdownV2) to a configured chat. Falls back to plain text if rendering fails.
-6. **Cron Trigger** — Exposes a `GET /api/trigger-analysis?secret=<CRON_SECRET>` endpoint that kicks off the full pipeline.
+Marcus is a **news/catalyst analyst** for short-term traders (1–5 trading days). Technical analysis is deliberately out of scope.
+
+1. **Price Context** — Pulls daily bars from Yahoo Finance for the watchlist saved in the dashboard; only price, daily change and 5-day return are passed to the model so it can tie news to moves.
+2. **News Search** — Gemini runs with **Google Search grounding** (no extra API key) and returns a JSON brief: headline, overall sentiment, changes since last brief, market news, scheduled events for the next 5 trading days, and what to watch.
+3. **News-Driven Direction** — For every watchlist symbol Marcus gives a 1–5 day direction (bullish / bearish / neutral) with confidence and the news behind it. **Direction only — no prices, levels or targets.** Code fills missing symbols as neutral and flags direction changes versus the previous brief.
+4. **Sources** — Cited URLs are read from the grounding metadata. If a run returns no sources, the brief is flagged as unverified.
+5. **Delivery** — A short brief goes to Telegram (HTML parse mode, rendered and escaped by code); the full brief and source list live on the dashboard.
+6. **Memory** — The latest brief and per-symbol directions is stored in Upstash Redis so the next run can report what changed; each run is archived to Supabase `analysis_history`. A failed run does not overwrite the previous memory.
 
 ## Default Watchlist
 
@@ -27,7 +29,7 @@ An AI-powered quantitative market analyst that fetches live market data, compute
 
 - **Runtime**: Python 3.11+
 - **Web framework**: FastAPI (deployed on Vercel)
-- **AI model**: Google Gemini (`gemini-3.1-flash-lite`)
+- **AI model**: Google Gemini (`gemini-3.8-flash`) with Google Search grounding
 - **Memory store**: Upstash Redis
 - **Notifications**: Telegram Bot API
 
@@ -36,18 +38,21 @@ An AI-powered quantitative market analyst that fetches live market data, compute
 | Variable                    | Description                          |
 |-----------------------------|--------------------------------------|
 | `GEMINI_API_KEY`            | Google Gemini API key                |
+| `GEMINI_MODEL`              | Optional, defaults to `gemini-3.8-flash` (must support Google Search grounding) |
 | `TG_TOKEN`                  | Telegram bot token                   |
 | `TG_CHAT_ID`                | Target Telegram chat/channel ID      |
 | `CRON_SECRET`               | Secret token to authenticate cron calls |
 | `UPSTASH_REDIS_REST_URL`    | Upstash Redis REST endpoint          |
 | `UPSTASH_REDIS_REST_TOKEN`  | Upstash Redis REST token             |
+| `SUPABASE_URL`              | Supabase project URL (optional, history archive) |
+| `SUPABASE_SERVICE_KEY`      | Supabase service role key (optional) |
 
 ## Deployment (Vercel)
 
 1. Fork/clone this repo and import it into Vercel.
 2. Set all environment variables above in the Vercel project settings.
 3. Vercel picks up `vercel.json` automatically — no extra configuration needed.
-4. Set up a cron job (e.g. via Vercel Cron or any external scheduler) to call:
+4. `vercel.json` schedules **two runs a day** via Vercel Cron: 23:00 UTC (07:00 Kuala Lumpur, after the US close) and 12:00 UTC (20:00 Kuala Lumpur, before the US open). Vercel sends `Authorization: Bearer <CRON_SECRET>` automatically. If you used an external scheduler before, disable it to avoid duplicate runs; it can still call:
    ```
    GET https://<your-domain>/api/trigger-analysis?secret=<CRON_SECRET>
    ```
@@ -78,15 +83,27 @@ GET http://localhost:8000/api/trigger-analysis?secret=<CRON_SECRET>
 |--------|-----------------------------|------------------------------------|
 | `GET`  | `/`                         | Health check — returns model/version info |
 | `GET`  | `/api/trigger-analysis`     | Runs full pipeline (requires `secret` query param) |
+| `GET`  | `/api/memory`               | Latest brief (full report + sources) |
+| `GET`  | `/api/history`              | Archived runs from Supabase |
 
 ## Report Structure
 
-Each Telegram message follows a fixed template:
+Telegram brief (full version on the dashboard):
 
 ```
-🎯 Core Conclusion
-📊 Market Facts       (objective data only)
-🌍 Macro Speculation  (each item tagged [Speculation] with confidence level)
-⚖️  Correction & Last-Session Review
-⚡ Actionable Reference
+🎯 Headline [sentiment]
+🌍 Market News       up to 5 items: what happened → which assets, which direction
+🧭 Direction (1–5d)  🟢 bullish / 🔴 bearish / ⚪ neutral per symbol, confidence, driving news, 🔄 on change
+📅 Next 5 Days       earnings, central banks, data releases
+👀 Watch
+🔗 Sources
+```
+
+Grounded search is billed per query beyond Gemini's free quota, and Google's terms ask apps that show grounded results to also display the returned Search Suggestions; check both before scaling up the schedule.
+
+## Tests
+
+```bash
+pip install -r requirements.txt pytest httpx
+pytest tests
 ```

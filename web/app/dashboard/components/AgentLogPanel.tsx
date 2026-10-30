@@ -54,6 +54,28 @@ export default function AgentLogPanel() {
                 </div>
               </div>
 
+              {data.sources && data.sources.length > 0 && (
+                <div className="mt-2">
+                  <p className="text-xs text-gray-500 mb-1 uppercase tracking-wider">
+                    Sources
+                  </p>
+                  <ul className="flex flex-col gap-1">
+                    {data.sources.map((s) => (
+                      <li key={s.uri} className="text-xs font-mono truncate">
+                        <a
+                          href={s.uri}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-sky-400 hover:text-sky-300"
+                        >
+                          {s.title}
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
               {data.snapshot && (
                 <div className="mt-2">
                   <p className="text-xs text-gray-500 mb-1 uppercase tracking-wider">
