@@ -261,3 +261,28 @@ def test_watchlist_validation(monkeypatch):
         r = client.post("/api/watchlist", json={"symbols": ["NVDA", bad]})
         assert r.status_code == 422, bad
     assert json.loads(redis.store["marcus_watchlist"])[0] == "NVDA"
+
+
+def test_chart_timeframes(monkeypatch):
+    from fastapi.testclient import TestClient
+    redis = FakeRedis()
+    redis.store["marcus_watchlist"] = json.dumps(["NVDA"])
+    monkeypatch.setattr(main, "get_redis", lambda: redis)
+    urls = []
+
+    def fake_get(url, **kw):
+        urls.append(url)
+        return Resp(yahoo_payload(n=30))
+
+    monkeypatch.setattr(main.requests, "get", fake_get)
+    client = TestClient(main.app)
+
+    r = client.get("/api/chart/NVDA").json()
+    assert r["tf"] == "D" and len(r["candles"]) == 30 and "interval=1d" in urls[-1]
+    assert "rsi" not in r
+    client.get("/api/chart/NVDA?tf=60")
+    assert "interval=1h" in urls[-1] and "range=1y" in urls[-1]
+    client.get("/api/chart/NVDA?tf=15")
+    assert "interval=15m" in urls[-1]
+    assert client.get("/api/chart/NVDA?tf=5").status_code == 422
+    assert client.get("/api/chart/AAPL").status_code == 404

@@ -135,7 +135,19 @@ table.dirs { width: 100%; border-collapse: collapse; }
 .tabs button { border: 0; background: none; padding: 0 0 3px; color: var(--muted); border-bottom: 2px solid transparent; white-space: nowrap; }
 .tabs button.on { color: var(--ink); border-color: var(--ink); font-weight: 700; }
 .chart { margin-top: 6px; min-height: 220px; }
-.candles { display: block; font-family: var(--sans); }
+.tfbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 12px; font-family: var(--sans); }
+.tfs { display: inline-flex; border: 1px solid var(--ink); }
+.tfs button { border: 0; background: none; font-size: 12px; padding: 4px 12px; color: var(--muted); }
+.tfs button + button { border-left: 1px solid var(--rule); }
+.tfs button.on { background: var(--ink); color: var(--paper); font-weight: 700; }
+.tfbar .hint { font-size: 12px; color: var(--faint); white-space: nowrap; }
+.vela { position: relative; }
+.vela-box { height: 360px; }
+.vela-over { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: var(--paper); }
+@media (max-width: 640px) {
+  .vela-box { height: 280px; }
+  .tfbar .hint { display: none; }
+}
 .cap { font-family: var(--sans); font-size: 12px; color: var(--muted); margin-top: 6px; }
 
 /* bottom: upcoming / watch / past briefs, in the calmer style of mockup C */
