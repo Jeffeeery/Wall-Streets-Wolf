@@ -95,33 +95,35 @@ export default function Almanac({ brief, symbols, latestTime }: { brief?: Brief;
 
   return (
     <section className="sec calm">
-      <div className="cb">
-        <h2>未来五日</h2>
-        {brief?.upcoming.length ? (
-          brief.upcoming.map((u, i) => (
-            <div key={i} className="ev">
-              <EventDate date={u.date} />
-              <div>
-                <h4>{u.event}</h4>
-                <p>{[u.affects, u.why].filter(Boolean).join(" · ")}</p>
+      <div className="duo">
+        <div className="cb">
+          <h2>未来五日</h2>
+          {brief?.upcoming.length ? (
+            brief.upcoming.map((u, i) => (
+              <div key={i} className="ev">
+                <EventDate date={u.date} />
+                <div>
+                  <h4>{u.event}</h4>
+                  <p>{[u.affects, u.why].filter(Boolean).join(" · ")}</p>
+                </div>
               </div>
-            </div>
-          ))
-        ) : (
-          <p className="state">暂无已知事件</p>
-        )}
-      </div>
-      <div className="cb">
-        <h2>接下来留意</h2>
-        {brief?.watch.length ? (
-          <ul className="checks">
-            {brief.watch.map((w, i) => (
-              <li key={i}>{w}</li>
-            ))}
-          </ul>
-        ) : (
-          <p className="state">暂无</p>
-        )}
+            ))
+          ) : (
+            <p className="state">暂无已知事件</p>
+          )}
+        </div>
+        <div className="cb">
+          <h2>接下来留意</h2>
+          {brief?.watch.length ? (
+            <ul className="checks">
+              {brief.watch.map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+          ) : (
+            <p className="state">暂无</p>
+          )}
+        </div>
       </div>
       <div className="cb">
         <h2>
