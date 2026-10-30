@@ -12,9 +12,6 @@ export const metadata: Metadata = {
   applicationName: "华尔街之狼",
   manifest: "/manifest.webmanifest",
   appleWebApp: { capable: true, title: "华尔街之狼", statusBarStyle: "default" },
-  other: {
-    "strix-verification": "strix-verify-26fc4070fe31e551ebe10807212e458f",
-  },
 };
 
 export const viewport: Viewport = {
