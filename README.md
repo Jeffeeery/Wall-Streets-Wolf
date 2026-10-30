@@ -6,12 +6,12 @@ An AI-powered quantitative market analyst that fetches live market data, compute
 
 Marcus is a **news/catalyst analyst** for short-term traders (1–5 trading days). Technical analysis is deliberately out of scope.
 
-1. **Price Context** — Pulls daily bars from Yahoo Finance for the watchlist saved in the dashboard; only price, daily change and 5-day return are passed to the model so it can tie news to moves.
-2. **News Search** — Gemini runs with **Google Search grounding** (no extra API key) and returns a JSON brief: headline, overall sentiment, changes since last brief, market news, scheduled events for the next 5 trading days, and what to watch.
-3. **News-Driven Direction** — For every watchlist symbol Marcus gives a 1–5 day direction (bullish / bearish / neutral) with confidence and the news behind it. **Direction only — no prices, levels or targets.** Code fills missing symbols as neutral and flags direction changes versus the previous brief.
-4. **Sources** — Cited URLs are read from the grounding metadata. If a run returns no sources, the brief is flagged as unverified.
-5. **Delivery** — A short brief goes to Telegram (HTML parse mode, rendered and escaped by code); the full brief and source list live on the dashboard.
-6. **Memory** — The latest brief and per-symbol directions is stored in Upstash Redis so the next run can report what changed; each run is archived to Supabase `analysis_history`. A failed run does not overwrite the previous memory.
+1. **Price Context** — Pulls daily bars from Yahoo Finance for the watchlist saved in the dashboard; price, daily change and 5-day return are passed to the model so it can tie news to moves.
+2. **News Search (Tavily)** — Code runs one search per watchlist symbol plus three macro topics (central banks/economy, geopolitics/commodities, this week's calendar), news-only and limited to the last day, in parallel. Results are de-duplicated and numbered `S1..Sn`.
+3. **Summary (Gemini, no tools)** — Gemini only summarizes the numbered results and returns a JSON brief (`responseSchema`): headline, sentiment, changes since last brief, market news, per-symbol direction, upcoming events and what to watch. No search tool is used, so it works on the free tier. If the primary model hits a quota/availability error, a fallback model is tried.
+4. **Citation Check** — Every news item and every bullish/bearish call must cite source IDs. Code drops news that cites no valid source and downgrades uncited directions to neutral. **Direction only — no prices, levels or targets.**
+5. **Delivery** — A short brief goes to Telegram (HTML, ↗ links to the original articles); the full brief with the numbered source list lives on the dashboard.
+6. **Memory** — The latest brief and per-symbol directions are stored in Upstash Redis so the next run can flag direction changes; each run is archived to Supabase `analysis_history`. A failed run does not overwrite the previous memory.
 
 ## Default Watchlist
 
@@ -29,7 +29,8 @@ Marcus is a **news/catalyst analyst** for short-term traders (1–5 trading days
 
 - **Runtime**: Python 3.11+
 - **Web framework**: FastAPI (deployed on Vercel)
-- **AI model**: Google Gemini (`gemini-3.8-flash`) with Google Search grounding
+- **AI model**: Google Gemini (`gemini-3.8-flash`, fallback `gemini-3.1-flash-lite-preview`), summarization only
+- **News search**: Tavily (free tier: 1,000 credits/month)
 - **Memory store**: Upstash Redis
 - **Notifications**: Telegram Bot API
 
@@ -38,7 +39,9 @@ Marcus is a **news/catalyst analyst** for short-term traders (1–5 trading days
 | Variable                    | Description                          |
 |-----------------------------|--------------------------------------|
 | `GEMINI_API_KEY`            | Google Gemini API key                |
-| `GEMINI_MODEL`              | Optional, defaults to `gemini-3.8-flash` (must support Google Search grounding) |
+| `GEMINI_MODEL`              | Optional, defaults to `gemini-3.8-flash` |
+| `GEMINI_FALLBACK_MODEL`     | Optional, tried on quota/availability errors; defaults to `gemini-3.1-flash-lite-preview` |
+| `TAVILY_API_KEY`            | Tavily API key (news search) |
 | `TG_TOKEN`                  | Telegram bot token                   |
 | `TG_CHAT_ID`                | Target Telegram chat/channel ID      |
 | `CRON_SECRET`               | Secret token to authenticate cron calls |
@@ -99,7 +102,7 @@ Telegram brief (full version on the dashboard):
 🔗 Sources
 ```
 
-Grounded search is billed per query beyond Gemini's free quota, and Google's terms ask apps that show grounded results to also display the returned Search Suggestions; check both before scaling up the schedule.
+Search budget: each run uses 3 + (number of watchlist symbols) Tavily credits. At two runs a day an 8-symbol watchlist uses about 660 of the 1,000 free monthly credits; above roughly 13 symbols the free tier runs out.
 
 ## Tests
 

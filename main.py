@@ -5,9 +5,10 @@ import logging
 import os
 import re
 import traceback as tb
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-from prompts import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
+from prompts import RESPONSE_SCHEMA, SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
 
 import pytz
 import requests
@@ -20,6 +21,7 @@ from upstash_redis import Redis
 # 1. 环境变量
 # ==========================================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 TG_TOKEN       = os.environ.get("TG_TOKEN")
 TG_CHAT_ID     = os.environ.get("TG_CHAT_ID")
 CRON_SECRET    = os.environ.get("CRON_SECRET", "")
@@ -33,7 +35,8 @@ WATCHLIST = ["^GSPC", "CL=F", "GC=F", "NVDA", "AAPL", "^VIX", "BTC-USD"]
 # Yahoo Finance 代码：NVDA / ^GSPC / CL=F / BTC-USD / 0700.HK / EURUSD=X
 YAHOO_SYMBOL_RE = re.compile(r"\^?[A-Z0-9][A-Z0-9.\-]{0,14}(=[FX])?")
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL          = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite-preview")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -237,7 +240,9 @@ class QuantDataEngine:
                 avg_vol20 = sum(volumes[-20:]) / min(20, len(volumes))
                 vol_ratio = round(volumes[-1] / avg_vol20, 2) if avg_vol20 and volumes[-1] else None
 
+                meta = result.get("meta") or {}
                 market_state[sym] = {
+                    "name":        meta.get("shortName") or meta.get("longName"),
                     "price":       round(latest, 2),
                     "pct_change":  round(pct_change, 2),
                     "ret_5d":      round(ret_5d, 2) if ret_5d is not None else None,
@@ -256,7 +261,7 @@ class QuantDataEngine:
 
 
 # ==========================================
-# 4. Marcus Agent：新闻检索 + 简报 + 发送
+# 4. Marcus Agent：Tavily 检索 + Gemini 总结 + 发送
 # ==========================================
 SENTIMENT_CN  = {"RISK_ON": "偏多 Risk-on", "RISK_OFF": "避险 Risk-off", "MIXED": "分化"}
 DIRECTION_ICON = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}
@@ -265,11 +270,135 @@ CONFIDENCE_CN  = {"HIGH": "高", "MEDIUM": "中", "LOW": "低"}
 NO_NEWS        = "无实质消息"
 IMPORTANCE_ICON = {"HIGH": "🔥", "MEDIUM": "•", "LOW": "·"}
 TG_LIMIT      = 4000
-TG_MAX_SOURCES = 6
+
+# 每期固定的宏观检索主题；品种检索按 watchlist 动态生成
+MACRO_QUERIES = [
+    ("宏观/央行", "stock market news today Federal Reserve inflation economy"),
+    ("地缘/大宗", "geopolitics oil gold markets news today"),
+    ("事件日历", "this week earnings calendar economic data FOMC CPI jobs report"),
+]
+# Yahoo 代码 → 检索关键词（期货/指数/外汇的代码本身搜不到新闻）
+SEARCH_ALIASES = {
+    "^GSPC": "S&P 500", "^IXIC": "Nasdaq", "^DJI": "Dow Jones", "^VIX": "VIX volatility",
+    "NQ=F": "Nasdaq 100 futures", "ES=F": "S&P 500 futures", "CL=F": "crude oil",
+    "GC=F": "gold price", "SI=F": "silver price", "BTC-USD": "Bitcoin", "ETH-USD": "Ethereum",
+}
+TAVILY_MAX_RESULTS  = 4
+NEWS_CONTENT_CHARS  = 400
+RETRYABLE_STATUS    = (429, 404, 500, 503)
 
 
 def load_watchlist() -> list[str]:
     return json.loads(get_redis().get("marcus_watchlist") or "null") or WATCHLIST
+
+
+def search_term(sym: str, market: dict) -> str:
+    if sym in SEARCH_ALIASES:
+        return SEARCH_ALIASES[sym]
+    name = (market.get(sym) or {}).get("name")
+    if sym.endswith("=X"):
+        pair = sym[:-2]
+        return f"{pair[:3]}/{pair[3:]} forex" if len(pair) == 6 else f"{pair} forex"
+    return f"{name} ({sym}) stock" if name else f"{sym} stock"
+
+
+def build_queries(watchlist: list[str], market: dict) -> list[tuple[str, str]]:
+    return MACRO_QUERIES + [(sym, f"{search_term(sym, market)} news") for sym in watchlist]
+
+
+def tavily_search(query: str) -> list[dict]:
+    res = requests.post(
+        "https://api.tavily.com/search",
+        headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
+        json={
+            "query":        query,
+            "topic":        "news",
+            "time_range":   "day",
+            "search_depth": "basic",
+            "max_results":  TAVILY_MAX_RESULTS,
+        },
+        timeout=15,
+    )
+    res.raise_for_status()
+    return res.json().get("results") or []
+
+
+def collect_news(queries: list[tuple[str, str]]) -> list[dict]:
+    """并行检索，按 URL 去重并编号 S1..Sn。单个检索失败不影响其他检索。"""
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda q: _safe_search(*q), queries))
+
+    sources, seen = [], set()
+    for (label, _), items in zip(queries, results):
+        for r in items:
+            url = r.get("url")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            sources.append({
+                "id":        f"S{len(sources) + 1}",
+                "topic":     label,
+                "title":     (r.get("title") or url).strip(),
+                "uri":       url,
+                "published": r.get("published_date") or "",
+                "content":   (r.get("content") or "").strip()[:NEWS_CONTENT_CHARS],
+            })
+    return sources
+
+
+def _safe_search(label: str, query: str) -> list[dict]:
+    try:
+        return tavily_search(query)
+    except Exception as e:
+        log.warning("Tavily 检索失败 [%s]: %s", label, e)
+        return []
+
+
+def format_news_context(sources: list[dict]) -> str:
+    blocks, current = [], None
+    for s in sources:
+        if s["topic"] != current:
+            current = s["topic"]
+            blocks.append(f"\n### {current}")
+        date = f" ({s['published']})" if s["published"] else ""
+        blocks.append(f"[{s['id']}]{date} {s['title']}\n{s['content']}")
+    return "\n".join(blocks).strip()
+
+
+def call_gemini(user_prompt: str) -> tuple[dict, str]:
+    """不带工具调用 Gemini（免费版可用），返回 (简报 JSON, 实际使用的模型)。
+    主模型配额不足/不可用时自动切换到备用模型。"""
+    payload = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {
+            "maxOutputTokens":  8192,
+            "responseMimeType": "application/json",
+            "responseSchema":   RESPONSE_SCHEMA,
+        },
+    }
+    models = list(dict.fromkeys(m for m in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL) if m))
+    last_err = ""
+    for model in models:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={GEMINI_API_KEY}",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=90,
+        )
+        res = resp.json()
+        if resp.status_code in RETRYABLE_STATUS:
+            last_err = f"{model}: {resp.status_code} {str(res)[:200]}"
+            log.warning("Gemini 模型不可用，尝试下一个: %s", last_err)
+            continue
+        try:
+            parts = res["candidates"][0]["content"]["parts"]
+            text  = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+            return extract_json(text), model
+        except (KeyError, IndexError, ValueError) as e:
+            raise RuntimeError(f"Gemini 响应无法解析 [{model}]: {e} | {str(res)[:300]}") from e
+    raise RuntimeError(f"所有 Gemini 模型都不可用: {last_err}")
 
 
 def extract_json(text: str) -> dict:
@@ -283,51 +412,42 @@ def extract_json(text: str) -> dict:
     return json.loads(text[start:end + 1])
 
 
-def extract_sources(candidate: dict) -> list[dict]:
-    """grounding 元数据中的检索来源，按出现顺序去重。"""
-    chunks = (candidate.get("groundingMetadata") or {}).get("groundingChunks") or []
-    sources, seen = [], set()
-    for ch in chunks:
-        web = ch.get("web") or {}
-        uri = web.get("uri")
-        if uri and uri not in seen:
-            seen.add(uri)
-            sources.append({"title": web.get("title") or uri, "uri": uri})
-    return sources
+def resolve_citations(brief: dict, sources: list[dict]) -> list[dict]:
+    """
+    把各条目引用的来源编号换成真实链接；引用不存在的编号会被丢弃。
+    没有任何有效来源的要闻直接删除（视为编造）。返回被引用到的来源列表。
+    """
+    by_id = {s["id"]: s for s in sources}
+    cited: dict[str, dict] = {}
 
+    def links(item: dict) -> list[dict]:
+        out = []
+        for sid in item.get("sources") or []:
+            s = by_id.get(str(sid).strip().strip("[]"))
+            if s and s["id"] not in {x["id"] for x in out}:
+                out.append({"id": s["id"], "title": s["title"], "uri": s["uri"]})
+                cited[s["id"]] = out[-1]
+        return out
 
-def call_gemini(user_prompt: str) -> tuple[dict, list[dict]]:
-    """开启 Google Search grounding 调用 Gemini，返回 (简报 JSON, 来源列表)。"""
-    gemini_url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    )
-    payload = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "tools": [{"google_search": {}}],
-        "generationConfig": {"maxOutputTokens": 8192},
-    }
-    res = requests.post(
-        gemini_url,
-        json=payload,
-        headers={"Content-Type": "application/json"},
-        timeout=90,
-    ).json()
-    try:
-        candidate = res["candidates"][0]
-        text = "".join(
-            p.get("text", "") for p in candidate["content"]["parts"] if not p.get("thought")
-        )
-        return extract_json(text), extract_sources(candidate)
-    except (KeyError, IndexError, ValueError) as e:
-        raise RuntimeError(f"Gemini 响应无法解析: {e} | {str(res)[:300]}") from e
+    kept = []
+    for n in brief.get("market_news") or []:
+        n["links"] = links(n)
+        if n["links"]:
+            kept.append(n)
+    brief["market_news"] = kept
+
+    for key in ("outlook", "upcoming"):
+        for item in brief.get(key) or []:
+            item["links"] = links(item)
+
+    return sorted(cited.values(), key=lambda s: int(s["id"][1:]))
 
 
 def normalize_outlook(raw: list, symbols: list[str], prev: dict) -> list[dict]:
     """
     按 watchlist 顺序整理每个品种的消息面方向：丢弃不在 watchlist 的品种，
-    缺失的补为中性，非法枚举值回落到 NEUTRAL/LOW，并附上上期方向用于标注变化。
+    缺失的补为中性，非法枚举值回落到 NEUTRAL/LOW，没有有效来源的利好/利空降为中性，
+    并附上上期方向用于标注变化。
     """
     by_sym = {}
     for item in raw or []:
@@ -340,12 +460,17 @@ def normalize_outlook(raw: list, symbols: list[str], prev: dict) -> list[dict]:
         item = by_sym.get(sym, {})
         direction  = str(item.get("direction", "")).upper()
         confidence = str(item.get("confidence", "")).upper()
+        links      = item.get("links") or []
+        drivers    = item.get("drivers") or NO_NEWS
+        if direction not in DIRECTION_CN or (direction != "NEUTRAL" and not links):
+            direction, confidence, drivers = "NEUTRAL", "LOW", NO_NEWS
         out.append({
             "symbol":        sym,
-            "direction":     direction if direction in DIRECTION_CN else "NEUTRAL",
+            "direction":     direction,
             "confidence":    confidence if confidence in CONFIDENCE_CN else "LOW",
-            "drivers":       item.get("drivers") or NO_NEWS,
+            "drivers":       drivers,
             "explains_move": item.get("explains_move", ""),
+            "links":         links,
             "prev":          prev.get(sym),
         })
     return out
@@ -366,26 +491,29 @@ def format_price_context(market: dict) -> str:
     return "\n".join(lines) or "（行情数据拉取失败）"
 
 
-def render_telegram(now: str, brief: dict | None, sources: list[dict]) -> str:
+def _tg_link(links: list[dict]) -> str:
+    if not links:
+        return ""
+    return f' <a href="{html.escape(links[0]["uri"], quote=True)}">↗</a>'
+
+
+def render_telegram(now: str, brief: dict | None, error: str = "") -> str:
     e = html.escape
     out = [f"🐺 <b>Marcus Wolf · 消息面简报</b>  <code>{e(now)}</code>", ""]
 
     if not brief:
-        out.append("⚠️ <b>新闻检索引擎异常</b>，本期简报暂不可用，请查看服务端日志。")
+        out.append(f"⚠️ <b>{e(error or '分析引擎异常')}</b>，本期简报暂不可用，请查看服务端日志。")
         return "\n".join(out)
 
     sentiment = SENTIMENT_CN.get(brief.get("sentiment"), brief.get("sentiment", ""))
     out += [f"🎯 <b>核心</b> [{e(sentiment)}]", e(brief.get("headline", "")), ""]
-
-    if not sources:
-        out += ["⚠️ <i>本期未检索到来源，以下内容未经验证，请谨慎参考</i>", ""]
 
     news = brief.get("market_news") or []
     if news:
         out.append("🌍 <b>市场要闻</b>")
         for n in news:
             icon = IMPORTANCE_ICON.get(n.get("importance"), "•")
-            out.append(f"{icon} <b>{e(n.get('title', ''))}</b>")
+            out.append(f"{icon} <b>{e(n.get('title', ''))}</b>{_tg_link(n['links'])}")
             out.append(f"   {e(n.get('summary', ''))}")
             if n.get("impact"):
                 out.append(f"   → {e(n['impact'])}")
@@ -402,7 +530,7 @@ def render_telegram(now: str, brief: dict | None, sources: list[dict]) -> str:
             if o in quiet:
                 continue
             out.append(f"{DIRECTION_ICON[o['direction']]} <b>{e(o['symbol'])}</b> {e(fmt_direction(o))}")
-            out.append(f"   {e(o['drivers'])}")
+            out.append(f"   {e(o['drivers'])}{_tg_link(o['links'])}")
         if quiet:
             out.append(f"⚪ {NO_NEWS}：{e(', '.join(o['symbol'] for o in quiet))}")
         out.append("")
@@ -421,38 +549,31 @@ def render_telegram(now: str, brief: dict | None, sources: list[dict]) -> str:
         out += [f"• {e(w)}" for w in watch]
         out.append("")
 
-    if sources:
-        links = " | ".join(
-            f'<a href="{e(s["uri"], quote=True)}">{e(s["title"])}</a>'
-            for s in sources[:TG_MAX_SOURCES]
-        )
-        out += [f"🔗 <b>来源</b>：{links}", ""]
-
-    out.append("<i>完整版见 Dashboard</i>")
+    out.append("<i>↗ 为新闻原文链接 · 完整版见 Dashboard</i>")
     msg = "\n".join(out)
     if len(msg) <= TG_LIMIT:
         return msg
-    # 超长时丢掉来源行，避免截断到 HTML 标签中间
-    msg = "\n".join(line for line in out if not line.startswith("🔗"))
-    return msg if len(msg) <= TG_LIMIT else html.escape(html.unescape(re.sub(r"<[^>]+>", "", msg)))[:TG_LIMIT]
+    # 超长时退回纯文本截断，避免截断到 HTML 标签中间
+    return html.escape(html.unescape(re.sub(r"<[^>]+>", "", msg)))[:TG_LIMIT]
 
 
-def render_full_report(now: str, brief: dict | None, sources: list[dict]) -> str:
+def render_full_report(now: str, brief: dict | None, sources: list[dict], error: str = "") -> str:
     out = [f"Marcus Wolf · 消息面完整简报 · {now}", ""]
     if not brief:
-        out.append("【新闻检索引擎异常】本期简报暂不可用。")
+        out.append(f"【{error or '分析引擎异常'}】本期简报暂不可用。")
         return "\n".join(out)
+
+    def refs(item: dict) -> str:
+        return " " + "".join(f"[{l['id']}]" for l in item.get("links") or []) if item.get("links") else ""
 
     sentiment = SENTIMENT_CN.get(brief.get("sentiment"), brief.get("sentiment", ""))
     out += [f"【核心】[{sentiment}]", brief.get("headline", ""), ""]
-    if not sources:
-        out += ["⚠️ 本期未检索到来源，以下内容未经验证。", ""]
     if brief.get("changes"):
         out += ["【相比上期】", brief["changes"], ""]
 
     out.append("【市场要闻】")
     for n in brief.get("market_news") or []:
-        out.append(f"• [{n.get('importance', '')}] {n.get('title', '')}")
+        out.append(f"• [{n.get('importance', '')}] {n.get('title', '')}{refs(n)}")
         out.append(f"  {n.get('summary', '')}")
         if n.get("impact"):
             out.append(f"  影响：{n['impact']}")
@@ -460,14 +581,14 @@ def render_full_report(now: str, brief: dict | None, sources: list[dict]) -> str
 
     out.append("【消息面方向（1-5 日）】")
     for o in brief.get("outlook") or []:
-        out.append(f"• {o['symbol']} {fmt_direction(o)}：{o['drivers']}")
+        out.append(f"• {o['symbol']} {fmt_direction(o)}：{o['drivers']}{refs(o)}")
         if o["explains_move"]:
             out.append(f"  与今日涨跌：{o['explains_move']}")
     out.append("")
 
     out.append("【未来 5 日事件】")
     for u in brief.get("upcoming") or []:
-        out.append(f"• {u.get('date', '')} {u.get('event', '')} | {u.get('affects', '')}")
+        out.append(f"• {u.get('date', '')} {u.get('event', '')} | {u.get('affects', '')}{refs(u)}")
         if u.get("why"):
             out.append(f"  {u['why']}")
     out.append("")
@@ -479,7 +600,7 @@ def render_full_report(now: str, brief: dict | None, sources: list[dict]) -> str
 
     if sources:
         out.append("【来源】")
-        out += [f"• {s['title']}: {s['uri']}" for s in sources]
+        out += [f"[{s['id']}] {s['title']}: {s['uri']}" for s in sources]
 
     return "\n".join(out)
 
@@ -516,7 +637,7 @@ class MarcusAgent:
         tz  = pytz.timezone(TIMEZONE)
         now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
 
-        # 1. 拉取行情（只用于对照新闻解释涨跌）
+        # 1. 拉取行情（只用于对照新闻解释涨跌 + 生成检索关键词）
         watchlist = load_watchlist()
         market    = QuantDataEngine.fetch_and_calculate(watchlist)
 
@@ -533,29 +654,39 @@ class MarcusAgent:
         else:
             last_brief = "无（首次运行）"
 
-        # 3. Gemini + Google Search 生成消息面简报
-        user_prompt = USER_PROMPT_TEMPLATE.format(
-            now=now,
-            timezone=TIMEZONE,
-            price_context=format_price_context(market),
-            last_brief=last_brief,
-        )
+        # 3. Tavily 检索新闻
+        news = collect_news(build_queries(watchlist, market)) if TAVILY_API_KEY else []
+
+        # 4. Gemini 只做总结（不带搜索工具，免费版可用）
         brief: dict | None = None
+        model_used = ""
+        error = ""
         sources: list[dict] = []
-        try:
-            brief, sources = call_gemini(user_prompt)
-        except Exception as e:
-            log.error("Gemini 调用失败: %s", e)
-        if brief and not sources:
-            log.warning("本期 Gemini 未返回检索来源，内容可能未经 grounding")
+        if not news:
+            error = "新闻检索失败" if TAVILY_API_KEY else "未配置 TAVILY_API_KEY"
+            log.error("%s，跳过本期分析", error)
+        else:
+            user_prompt = USER_PROMPT_TEMPLATE.format(
+                now=now,
+                timezone=TIMEZONE,
+                price_context=format_price_context(market),
+                last_brief=last_brief,
+                news_context=format_news_context(news),
+            )
+            try:
+                brief, model_used = call_gemini(user_prompt)
+            except Exception as e:
+                error = "分析引擎异常"
+                log.error("Gemini 调用失败: %s", e)
         if brief:
+            sources = resolve_citations(brief, news)
             brief["outlook"] = normalize_outlook(brief.get("outlook"), watchlist, prev_outlook)
         outlook_map = {o["symbol"]: o["direction"] for o in (brief or {}).get("outlook", [])}
 
-        # 4. 生成简报 / 完整报告，写入记忆和历史
-        tg_text    = render_telegram(now, brief, sources)
-        report     = render_full_report(now, brief, sources)
-        conclusion = (brief or {}).get("headline") or "新闻检索引擎异常，本期无简报"
+        # 5. 生成简报 / 完整报告，写入记忆和历史
+        tg_text    = render_telegram(now, brief, error)
+        report     = render_full_report(now, brief, sources, error)
+        conclusion = (brief or {}).get("headline") or f"{error}，本期无简报"
         sentiment  = (brief or {}).get("sentiment")
         price_snapshot = {sym: d.get("price") for sym, d in market.items()}
 
@@ -581,12 +712,13 @@ class MarcusAgent:
                 "outlook":       outlook_map,
             })
 
-        # 5. 发送 Telegram
+        # 6. 发送 Telegram
         send_telegram(tg_text)
 
         return (
             f"报告已发送 | {now} | 资产覆盖: {list(market.keys())} | "
-            f"来源 {len(sources)} 条 | {'OK' if brief else '引擎异常'}"
+            f"检索 {len(news)} 条 / 引用 {len(sources)} 条 | "
+            f"{model_used or error}"
         )
 
 
