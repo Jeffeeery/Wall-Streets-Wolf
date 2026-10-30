@@ -3,6 +3,7 @@ import CandleChart from "./components/CandleChart";
 import AgentLogPanel from "./components/AgentLogPanel";
 import WatchlistEditor from "./components/WatchlistEditor";
 import HistoryPanel from "./components/HistoryPanel";
+import SignalsPanel from "./components/SignalsPanel";
 
 export const dynamic = "force-dynamic";
 
@@ -23,6 +24,13 @@ export default function DashboardPage() {
         <div className="lg:col-span-1">
           <AgentLogPanel />
         </div>
+      </section>
+
+      <section>
+        <h2 className="text-xs text-gray-500 uppercase tracking-widest mb-3">
+          Signals · Auto-settled on hourly bars
+        </h2>
+        <SignalsPanel />
       </section>
 
       <section>

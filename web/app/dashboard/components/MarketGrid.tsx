@@ -62,7 +62,7 @@ function SymbolCard({
       </div>
       <RSIBadge value={data.RSI_14} />
       <div className="text-xs text-gray-500 flex gap-3">
-        <span>Vol×{data.vol_ratio.toFixed(2)}</span>
+        <span>Vol×{data.vol_ratio != null ? data.vol_ratio.toFixed(2) : "—"}</span>
         <span>ATR {data.ATR_14}</span>
         <span
           className={data.above_MA200 ? "text-emerald-500" : "text-red-500"}

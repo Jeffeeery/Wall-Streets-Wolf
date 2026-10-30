@@ -4,12 +4,15 @@ An AI-powered quantitative market analyst that fetches live market data, compute
 
 ## How It Works
 
-1. **Data Fetch** — Pulls up to 250 days of daily OHLCV data from Yahoo Finance for a configurable watchlist.
-2. **Quant Indicators** — Calculates RSI-14, MA-20/50 trend, ATR-14, and 20-day volume ratio for each asset.
-3. **AI Analysis** — Sends the snapshot + last session's memory to Gemini, which responds as *Marcus Wolf*, a cold-and-precise quantitative macro analyst.
-4. **Memory** — Stores the current report summary in Upstash Redis so the next run can compare against it.
-5. **Telegram Delivery** — Posts the formatted report (Telegram MarkdownV2) to a configured chat. Falls back to plain text if rendering fails.
-6. **Cron Trigger** — Exposes a `GET /api/trigger-analysis?secret=<CRON_SECRET>` endpoint that kicks off the full pipeline.
+Marcus is tuned for **short-term trading (1–5 trading days)** and issues verifiable signals instead of free-form commentary.
+
+1. **Data Fetch** — Pulls 250 days of daily bars and 1 month of hourly bars from Yahoo Finance for the watchlist saved in the dashboard.
+2. **Quant Indicators** — Daily: RSI-14, MA-20/50 trend, MA-50/200 position, Wilder ATR-14 (and ATR %), 5-day return, volume ratio, classic pivots (P/R1/S1/R2/S2 from the last completed session), 20-day swing high/low and distance to them in ATR. Hourly: EMA-20/50 trend and RSI.
+3. **Signal Settlement** — Before each run, every open signal is settled against hourly bars with conservative rules (fill only when price touches entry; stop wins ties; fill bar checks stop only; gaps fill at the open). Outcomes: `WIN` / `LOSS` / `EXPIRED` (marked to last close) / `NOT_TRIGGERED`.
+4. **AI Analysis** — Gemini receives the snapshot plus the code-computed track record and returns structured JSON (`responseSchema`): conclusion, regime, per-asset bias, up to 3 signals with entry/stop/target/horizon/confidence, review and key risk.
+5. **Risk Checks** — Code rejects signals with wrong price ordering, R:R < 1.5, stop outside 0.3–3 ATR, entry more than 1.5 ATR from price, or a symbol that already has an open signal.
+6. **Delivery** — A short brief goes to Telegram (HTML parse mode, rendered and escaped by code); the full analysis, rejected signals and stats live on the dashboard.
+7. **Storage** — Signals and the latest memory in Upstash Redis; each run archived to Supabase `analysis_history`.
 
 ## Default Watchlist
 
@@ -41,6 +44,8 @@ An AI-powered quantitative market analyst that fetches live market data, compute
 | `CRON_SECRET`               | Secret token to authenticate cron calls |
 | `UPSTASH_REDIS_REST_URL`    | Upstash Redis REST endpoint          |
 | `UPSTASH_REDIS_REST_TOKEN`  | Upstash Redis REST token             |
+| `SUPABASE_URL`              | Supabase project URL (optional, history archive) |
+| `SUPABASE_SERVICE_KEY`      | Supabase service role key (optional) |
 
 ## Deployment (Vercel)
 
@@ -78,15 +83,27 @@ GET http://localhost:8000/api/trigger-analysis?secret=<CRON_SECRET>
 |--------|-----------------------------|------------------------------------|
 | `GET`  | `/`                         | Health check — returns model/version info |
 | `GET`  | `/api/trigger-analysis`     | Runs full pipeline (requires `secret` query param) |
+| `GET`  | `/api/signals`              | Signal log + win rate / average R stats |
+| `GET`  | `/api/memory`               | Latest analysis (full report) |
+| `GET`  | `/api/history`              | Archived runs from Supabase |
 
 ## Report Structure
 
-Each Telegram message follows a fixed template:
+Telegram brief (full version on the dashboard):
 
 ```
-🎯 Core Conclusion
-📊 Market Facts       (objective data only)
-🌍 Macro Speculation  (each item tagged [Speculation] with confidence level)
-⚖️  Correction & Last-Session Review
-⚡ Actionable Reference
+🎯 Core Conclusion [regime]
+⚡ Signals          symbol | direction | entry | stop | target | R:R | horizon | confidence
+📋 Signal Tracking  settled + still-open signals with R multiple
+📈 Track Record     closed trades, win rate, avg R, by confidence
+⚠️ Key Risk
+```
+
+For short-term use, schedule the trigger at least once per trading day (e.g. before the US open); signals are settled on each run.
+
+## Tests
+
+```bash
+pip install -r requirements.txt pytest httpx
+pytest tests
 ```
