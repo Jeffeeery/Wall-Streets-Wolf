@@ -4,7 +4,7 @@ import useSWR from "swr";
 import { fetchHistory } from "@/lib/api";
 import type { Brief, HistoryRecord } from "@/lib/types";
 import { DIR_GLYPH, dirTone, shortName } from "@/lib/brief";
-import { DIRECTION_LABEL, formatRunTime, SENTIMENT_LABEL } from "@/lib/format";
+import { DIRECTION_LABEL, SENTIMENT_LABEL } from "@/lib/format";
 import { Chevron, Hits } from "./NewsSection";
 import Reveal from "./Reveal";
 
@@ -24,17 +24,17 @@ function legacyTitle(r: HistoryRecord) {
 /** 分析引擎出错的那几次只有一行错误提示，不列出来 */
 const failed = (r: HistoryRecord) => !r.brief && /分析引擎异常/.test(r.report ?? r.conclusion ?? "");
 
-/** "2026-11-04" → 大号日期 + "11月 周三" */
+/** "2026-11-04" → "11/4" + "周三" */
 function EventDate({ date }: { date: string }) {
   const m = date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!m) return <div className="dd small">{date}</div>;
+  if (!m) return <div className="d"><b>{date}</b></div>;
   const wd = "日一二三四五六"[new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])).getUTCDay()];
   return (
-    <div className="dd">
-      {+m[3]}
-      <small>
-        {+m[2]}月 周{wd}
-      </small>
+    <div className="d">
+      <b>
+        {+m[2]}/{+m[3]}
+      </b>
+      周{wd}
     </div>
   );
 }
@@ -72,10 +72,13 @@ function Edition({ r, symbols }: { r: HistoryRecord; symbols: string[] }) {
     <div className={`ed${open ? " open" : ""}`}>
       <button type="button" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
         <small>
-          {formatRunTime(r.analysis_time)} · {sentiment ? SENTIMENT_LABEL[sentiment] : "旧版"}
-          <Chevron />
+          {r.analysis_time.slice(5)}
+          <em className={sentiment === "RISK_OFF" ? "down" : sentiment === "RISK_ON" ? "up" : ""}>
+            {sentiment ? SENTIMENT_LABEL[sentiment] : "旧版"}
+          </em>
         </small>
         <span>{title}</span>
+        <Chevron />
       </button>
       <Reveal open={open}>
         {legacy ? <p className="legacy">{plain(r.report ?? "")}</p> : <PastBrief brief={r.brief!} symbols={symbols} />}
@@ -91,17 +94,15 @@ export default function Almanac({ brief, symbols, latestTime }: { brief?: Brief;
   const rows = (data?.history ?? []).filter((r) => r.analysis_time !== latestTime && !failed(r));
 
   return (
-    <section className="sec three">
-      <div>
-        <div className="sech">
-          <h3>未来五日</h3>
-        </div>
+    <section className="sec calm">
+      <div className="cb">
+        <h2>未来五日</h2>
         {brief?.upcoming.length ? (
           brief.upcoming.map((u, i) => (
             <div key={i} className="ev">
               <EventDate date={u.date} />
               <div>
-                <b>{u.event}</b>
+                <h4>{u.event}</h4>
                 <p>{[u.affects, u.why].filter(Boolean).join(" · ")}</p>
               </div>
             </div>
@@ -110,24 +111,22 @@ export default function Almanac({ brief, symbols, latestTime }: { brief?: Brief;
           <p className="state">暂无已知事件</p>
         )}
       </div>
-      <div>
-        <div className="sech">
-          <h3>重点留意</h3>
-        </div>
+      <div className="cb">
+        <h2>接下来留意</h2>
         {brief?.watch.length ? (
-          <ol className="watch">
+          <ul className="checks">
             {brief.watch.map((w, i) => (
               <li key={i}>{w}</li>
             ))}
-          </ol>
+          </ul>
         ) : (
           <p className="state">暂无</p>
         )}
       </div>
-      <div>
-        <div className="sech">
-          <h3>往期</h3>
-        </div>
+      <div className="cb">
+        <h2>
+          往期 <small>点开回看当期要闻和方向</small>
+        </h2>
         {error && <p className="state">往期记录暂时加载不了。</p>}
         {data && rows.length === 0 && <p className="state">还没有往期记录。</p>}
         <div className="hist">
@@ -136,7 +135,7 @@ export default function Almanac({ brief, symbols, latestTime }: { brief?: Brief;
           ))}
         </div>
         {rows.length > shown && (
-          <button type="button" className="link more" onClick={() => setShown((n) => n + PAGE)}>
+          <button type="button" className="more" onClick={() => setShown((n) => n + PAGE)}>
             更早的 {Math.min(PAGE, rows.length - shown)} 期
           </button>
         )}

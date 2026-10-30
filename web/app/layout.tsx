@@ -4,7 +4,7 @@ import "./globals.css";
 // 中文字体由浏览器从 Google Fonts 按需加载（只下载页面用到的字符切片）。
 // 不用 next/font：它在构建时要下载上百个 CJK 切片，偶尔超时会让整个部署失败。
 const FONTS =
-  "https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@400;700;900&display=swap";
+  "https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@400;700;900&family=DM+Mono:wght@400;500&display=swap";
 
 export const metadata: Metadata = {
   title: "华尔街之狼 · Marcus 消息面日报",
