@@ -11,8 +11,8 @@
   --rule: #d3cec4;
   --red: #8c1d18;
   --green: #1e5e3b;
-  --serif: var(--font-serif), "Noto Serif SC", "Songti SC", "SimSun", serif;
-  --sans: var(--font-sans), "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --serif: "Noto Serif SC", "Songti SC", "SimSun", serif;
+  --sans: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 
 html { background: #e6e2d9; }

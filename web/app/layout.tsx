@@ -1,10 +1,10 @@
 import type { Metadata, Viewport } from "next";
-import { Noto_Sans_SC, Noto_Serif_SC } from "next/font/google";
 import "./globals.css";
 
-// 中文字体很大，不预加载；Google 按字符区间切片，浏览器只下载页面用到的部分
-const serif = Noto_Serif_SC({ weight: ["400", "700", "900"], preload: false, display: "swap", variable: "--font-serif" });
-const sans = Noto_Sans_SC({ weight: ["400", "500", "700"], preload: false, display: "swap", variable: "--font-sans" });
+// 中文字体由浏览器从 Google Fonts 按需加载（只下载页面用到的字符切片）。
+// 不用 next/font：它在构建时要下载上百个 CJK 切片，偶尔超时会让整个部署失败。
+const FONTS =
+  "https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@400;700;900&display=swap";
 
 export const metadata: Metadata = {
   title: "华尔街之狼 · Marcus 消息面日报",
@@ -25,7 +25,12 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="zh-CN" className={`${serif.variable} ${sans.variable}`}>
+    <html lang="zh-CN">
+      <head>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
+        <link rel="stylesheet" href={FONTS} />
+      </head>
       <body>
         <main>{children}</main>
       </body>
