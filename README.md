@@ -8,7 +8,7 @@ Marcus is a **news/catalyst analyst** for short-term traders (1–5 trading days
 
 1. **Price Context** — Pulls daily bars from Yahoo Finance for the watchlist saved in the dashboard; price, daily change and 5-day return are passed to the model so it can tie news to moves.
 2. **News Search (Tavily)** — Code runs one search per watchlist symbol plus three macro topics (central banks/economy, geopolitics/commodities, this week's calendar), news-only and limited to the last day, in parallel. Results are de-duplicated and numbered `S1..Sn`.
-3. **Summary (Gemini, no tools)** — Gemini only summarizes the numbered results and returns a JSON brief (`responseSchema`): headline, sentiment, changes since last brief, market news, per-symbol direction, upcoming events and what to watch. No search tool is used, so it works on the free tier. A temporary 500/503 is retried once after 5 seconds; any other failure switches straight to OpenCode Go (OpenAI-compatible API) with the same prompt and the JSON schema spelled out. When both fail, the Telegram notice states each provider's reason, and the last run's outcome is stored in Redis (`marcus_last_run`, also shown on `GET /`) because Vercel Hobby keeps runtime logs for only an hour.
+3. **Summary (Gemini, no tools)** — Gemini only summarizes the numbered results and returns a JSON brief (`responseSchema`): headline, sentiment, changes since last brief, market news, per-symbol direction, upcoming events and what to watch. No search tool is used, so it works on the free tier. A temporary 500/503 is retried once after 5 seconds; any other failure switches straight to OpenCode Go. The default fallback is `gemini-4-argon` with high thinking effort, called through OpenCode's Google-native `generateContent` route so the same `responseSchema` applies. Non-Gemini OpenCode models go through the OpenAI-compatible route, where the JSON schema is spelled out in the prompt. When both fail, the Telegram notice states each provider's reason, and the last run's outcome is stored in Redis (`marcus_last_run`, also shown on `GET /`) because Vercel Hobby keeps runtime logs for only an hour.
 4. **Citation Check** — Every news item and every bullish/bearish call must cite source IDs. Code drops news that cites no valid source and downgrades uncited directions to neutral. **Direction only — no prices, levels or targets.**
 5. **Delivery** — A short brief goes to Telegram (HTML, ↗ links to the original articles); the full brief with the numbered source list lives on the dashboard.
 6. **Memory** — The latest brief and per-symbol directions are stored in Upstash Redis so the next run can flag direction changes; each run is archived to Supabase `analysis_history`. A failed run does not overwrite the previous memory.
@@ -41,8 +41,10 @@ Marcus is a **news/catalyst analyst** for short-term traders (1–5 trading days
 | `GEMINI_API_KEY`            | Google Gemini API key                |
 | `GEMINI_MODEL`              | Optional, defaults to `gemini-3.8-flash` |
 | `OPENCODE_API_KEY`          | OpenCode Go API key (fallback when Gemini fails) |
-| `OPENCODE_MODEL`            | Optional, defaults to `glm-5.1`; check the live model list at `https://opencode.ai/inference/go/v1/models` |
-| `OPENCODE_BASE_URL`         | Optional, defaults to `https://opencode.ai/inference/go/openai/v1` |
+| `OPENCODE_MODEL`            | Optional, defaults to `gemini-4-argon`; `gemini-*` models use the Google-native route, others the OpenAI-compatible route |
+| `OPENCODE_EFFORT`           | Optional, defaults to `high` (Gemini `thinkingLevel` / OpenAI `reasoning_effort`); empty disables it |
+| `OPENCODE_GOOGLE_BASE_URL`  | Optional, defaults to `https://opencode.ai/inference/go/google/v1beta` (falls back to `/inference/go/v1` on 404) |
+| `OPENCODE_BASE_URL`         | Optional, OpenAI-compatible route, defaults to `https://opencode.ai/inference/go/openai/v1` |
 | `TAVILY_API_KEY`            | Tavily API key (news search) |
 | `TG_TOKEN`                  | Telegram bot token                   |
 | `TG_CHAT_ID`                | Target Telegram chat/channel ID      |
