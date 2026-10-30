@@ -90,7 +90,9 @@ def env(monkeypatch):
     monkeypatch.setattr(main, "SUPABASE_URL", "http://sb")
     monkeypatch.setattr(main, "SUPABASE_KEY", "k")
     monkeypatch.setattr(main, "TAVILY_API_KEY", "tvly")
-    calls = {"tg": [], "sb": [], "gemini": [], "tavily": [], "gemini_resps": []}
+    monkeypatch.setattr(main, "OPENCODE_API_KEY", "oc-key")
+    monkeypatch.setattr(main.time, "sleep", lambda s: None)
+    calls = {"tg": [], "sb": [], "gemini": [], "tavily": [], "gemini_resps": [], "opencode": [], "opencode_resps": []}
 
     def fake_get(url, **kw):
         return Resp(yahoo_payload())
@@ -102,6 +104,9 @@ def env(monkeypatch):
         if "generativelanguage" in url:
             calls["gemini"].append((url, json))
             return calls["gemini_resps"].pop(0)
+        if "opencode.ai" in url:
+            calls["opencode"].append((url, json, kw.get("headers")))
+            return calls["opencode_resps"].pop(0)
         if "telegram" in url:
             calls["tg"].append(json)
             return Resp({"ok": True})
@@ -162,22 +167,57 @@ def test_full_run(env):
     assert "🟢 <b>NVDA</b> 利好（低） 🔄 前次利空" in calls["tg"][1]["text"]
 
 
-def test_fallback_model_on_quota_error(env):
+def opencode_resp(brief, status=200, think=False):
+    if status != 200:
+        return Resp({"error": {"message": "nope"}}, status)
+    text = json.dumps(brief, ensure_ascii=False)
+    if think:
+        text = "<think>先想想 {不是 JSON}</think>\n```json\n" + text + "\n```"
+    return Resp({"choices": [{"message": {"content": text}}]})
+
+
+def test_gemini_503_retries_once_then_succeeds(env):
     redis, calls = env
-    calls["gemini_resps"] = [gemini_resp(None, 429), gemini_resp(BRIEF)]
+    calls["gemini_resps"] = [gemini_resp(None, 503), gemini_resp(BRIEF)]
     msg = main.MarcusAgent.execute_and_send()
-    assert main.GEMINI_FALLBACK_MODEL in msg
-    assert main.GEMINI_MODEL in calls["gemini"][0][0] and main.GEMINI_FALLBACK_MODEL in calls["gemini"][1][0]
+    assert main.GEMINI_MODEL in msg and len(calls["gemini"]) == 2 and calls["opencode"] == []
 
 
-def test_gemini_failure_keeps_last_memory(env):
+def test_gemini_failure_switches_to_opencode(env):
+    redis, calls = env
+    calls["gemini_resps"] = [gemini_resp(None, 429)]  # 配额用完不重试，直接切换
+    calls["opencode_resps"] = [opencode_resp(BRIEF, think=True)]
+    msg = main.MarcusAgent.execute_and_send()
+    assert f"opencode/{main.OPENCODE_MODEL}" in msg and len(calls["gemini"]) == 1
+
+    url, body, headers = calls["opencode"][0]
+    assert url == f"{main.OPENCODE_BASE_URL}/chat/completions"
+    assert headers["Authorization"] == "Bearer oc-key" and body["model"] == main.OPENCODE_MODEL
+    assert "JSON Schema" in body["messages"][1]["content"]
+    assert "🔴 <b>NVDA</b>" in calls["tg"][0]["text"]  # 备用模型的结果照常经过引用校验和渲染
+    assert json.loads(redis.store["marcus_last_run"])["ok"] is True
+
+
+def test_all_models_fail_reports_reason_and_keeps_memory(env):
     redis, calls = env
     redis.store["marcus_memory"] = json.dumps({"time": "t", "conclusion": "上期"})
-    calls["gemini_resps"] = [gemini_resp(None, 429), gemini_resp(None, 429)]
+    calls["gemini_resps"] = [gemini_resp(None, 503), gemini_resp(None, 503)]
+    calls["opencode_resps"] = [opencode_resp(None, 401)]
     msg = main.MarcusAgent.execute_and_send()
-    assert "引擎异常" in msg and "引擎异常" in calls["tg"][0]["text"]
+    reason = "Gemini 服务过载（503）；OpenCode key 无效（401）"
+    assert reason in msg and reason in calls["tg"][0]["text"]
     assert json.loads(redis.store["marcus_memory"])["conclusion"] == "上期"
     assert calls["sb"] == []
+    last = json.loads(redis.store["marcus_last_run"])
+    assert last["ok"] is False and reason in last["error"]
+
+
+def test_opencode_not_configured(env, monkeypatch):
+    redis, calls = env
+    monkeypatch.setattr(main, "OPENCODE_API_KEY", "")
+    calls["gemini_resps"] = [gemini_resp(None, 404)]
+    msg = main.MarcusAgent.execute_and_send()
+    assert "Gemini 模型不存在（404）；OpenCode 未配置 OPENCODE_API_KEY" in msg
 
 
 def test_no_news_skips_gemini(env, monkeypatch):
