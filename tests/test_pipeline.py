@@ -183,26 +183,41 @@ def test_gemini_503_retries_once_then_succeeds(env):
     assert main.GEMINI_MODEL in msg and len(calls["gemini"]) == 2 and calls["opencode"] == []
 
 
-def test_gemini_failure_switches_to_opencode(env):
+def test_gemini_failure_switches_to_opencode_gemini_4_argon(env):
     redis, calls = env
     calls["gemini_resps"] = [gemini_resp(None, 429)]  # 配额用完不重试，直接切换
-    calls["opencode_resps"] = [opencode_resp(BRIEF, think=True)]
+    calls["opencode_resps"] = [Resp({"error": "not found"}, 404), gemini_resp(BRIEF)]  # 第一个地址 404 → 换下一个
     msg = main.MarcusAgent.execute_and_send()
-    assert f"opencode/{main.OPENCODE_MODEL}" in msg and len(calls["gemini"]) == 1
+    assert "opencode/gemini-4-argon" in msg and len(calls["gemini"]) == 1
 
-    url, body, headers = calls["opencode"][0]
-    assert url == f"{main.OPENCODE_BASE_URL}/chat/completions"
-    assert headers["Authorization"] == "Bearer oc-key" and body["model"] == main.OPENCODE_MODEL
-    assert "JSON Schema" in body["messages"][1]["content"]
+    (url1, _, _), (url2, body, headers) = calls["opencode"]
+    assert url1 == "https://opencode.ai/inference/go/google/v1beta/models/gemini-4-argon:generateContent"
+    assert url2 == "https://opencode.ai/inference/go/v1/models/gemini-4-argon:generateContent"
+    assert headers["Authorization"] == "Bearer oc-key"
+    assert body["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "high"}
+    assert body["generationConfig"]["responseSchema"]  # Google 原生接口可用结构化输出
     assert "🔴 <b>NVDA</b>" in calls["tg"][0]["text"]  # 备用模型的结果照常经过引用校验和渲染
     assert json.loads(redis.store["marcus_last_run"])["ok"] is True
+
+
+def test_opencode_openai_compatible_models(env, monkeypatch):
+    redis, calls = env
+    monkeypatch.setattr(main, "OPENCODE_MODEL", "glm-5.1")
+    calls["gemini_resps"] = [gemini_resp(None, 429)]
+    calls["opencode_resps"] = [opencode_resp(BRIEF, think=True)]
+    msg = main.MarcusAgent.execute_and_send()
+    assert "opencode/glm-5.1" in msg
+    url, body, headers = calls["opencode"][0]
+    assert url == "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    assert body["model"] == "glm-5.1" and body["reasoning_effort"] == "high"
+    assert "JSON Schema" in body["messages"][1]["content"]
 
 
 def test_all_models_fail_reports_reason_and_keeps_memory(env):
     redis, calls = env
     redis.store["marcus_memory"] = json.dumps({"time": "t", "conclusion": "上期"})
     calls["gemini_resps"] = [gemini_resp(None, 503), gemini_resp(None, 503)]
-    calls["opencode_resps"] = [opencode_resp(None, 401)]
+    calls["opencode_resps"] = [Resp({"error": "bad key"}, 401)]
     msg = main.MarcusAgent.execute_and_send()
     reason = "Gemini 服务过载（503）；OpenCode key 无效（401）"
     assert reason in msg and reason in calls["tg"][0]["text"]

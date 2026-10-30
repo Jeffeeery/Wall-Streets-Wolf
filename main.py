@@ -38,10 +38,15 @@ WATCHLIST = ["^GSPC", "CL=F", "GC=F", "NVDA", "AAPL", "^VIX", "BTC-USD"]
 YAHOO_SYMBOL_RE = re.compile(r"\^?[A-Z0-9][A-Z0-9.\-]{0,14}(=[FX])?")
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-# Gemini 失败时的备用：OpenCode Go（OpenAI 兼容接口）。地址和模型名可用环境变量覆盖
+# Gemini 失败时的备用：OpenCode Go。gemini-* 模型走 Google 原生接口，其余走 OpenAI 兼容接口
 OPENCODE_API_KEY  = os.environ.get("OPENCODE_API_KEY", "")
-OPENCODE_BASE_URL = os.environ.get("OPENCODE_BASE_URL", "https://opencode.ai/inference/go/openai/v1")
-OPENCODE_MODEL    = os.environ.get("OPENCODE_MODEL", "glm-5.1")
+OPENCODE_MODEL    = os.environ.get("OPENCODE_MODEL", "gemini-4-argon")
+OPENCODE_EFFORT   = os.environ.get("OPENCODE_EFFORT", "high")
+OPENCODE_GOOGLE_BASES = [  # 官方文档地址在前；另一条是社区验证过可用的路径
+    os.environ.get("OPENCODE_GOOGLE_BASE_URL", "https://opencode.ai/inference/go/google/v1beta"),
+    "https://opencode.ai/inference/go/v1",
+]
+OPENCODE_OPENAI_BASE = os.environ.get("OPENCODE_BASE_URL", "https://opencode.ai/inference/go/openai/v1")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -302,6 +307,7 @@ TAVILY_MAX_RESULTS  = 4
 NEWS_CONTENT_CHARS  = 400
 GEMINI_RETRY_DELAY  = 5      # Gemini 临时过载（500/503）时等待后重试一次
 LLM_TIMEOUT         = 60
+OPENCODE_TIMEOUT    = 120    # 高思考等级更慢
 
 
 def load_watchlist() -> list[str]:
@@ -412,17 +418,34 @@ def _http_reason(status: int) -> str:
     }.get(status, f"HTTP {status}")
 
 
-def call_gemini(user_prompt: str) -> dict:
-    """不带工具调用 Gemini（免费版可用）。临时过载时等几秒重试一次。"""
-    payload = {
+def gemini_payload(user_prompt: str, thinking_level: str | None = None) -> dict:
+    config = {
+        "maxOutputTokens":  8192,
+        "responseMimeType": "application/json",
+        "responseSchema":   RESPONSE_SCHEMA,
+    }
+    if thinking_level:
+        config["thinkingConfig"] = {"thinkingLevel": thinking_level}
+    return {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": {
-            "maxOutputTokens":  8192,
-            "responseMimeType": "application/json",
-            "responseSchema":   RESPONSE_SCHEMA,
-        },
+        "generationConfig": config,
     }
+
+
+def parse_gemini_response(res: dict, provider: str) -> dict:
+    try:
+        parts = res["candidates"][0]["content"]["parts"]
+        text  = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+        return extract_json(text)
+    except (KeyError, IndexError, ValueError) as e:
+        log.warning("%s 响应无法解析: %s | %s", provider, e, str(res)[:300])
+        raise LLMError("返回内容无法解析") from e
+
+
+def call_gemini(user_prompt: str) -> dict:
+    """不带工具调用 Gemini（免费版可用）。临时过载时等几秒重试一次。"""
+    payload = gemini_payload(user_prompt)
     for attempt in range(2):
         try:
             resp = requests.post(
@@ -441,38 +464,64 @@ def call_gemini(user_prompt: str) -> dict:
         if resp.status_code != 200:
             log.warning("Gemini 失败 %s: %s", resp.status_code, resp.text[:300])
             raise LLMError(_http_reason(resp.status_code))
-        res = resp.json()
-        try:
-            parts = res["candidates"][0]["content"]["parts"]
-            text  = "".join(p.get("text", "") for p in parts if not p.get("thought"))
-            return extract_json(text)
-        except (KeyError, IndexError, ValueError) as e:
-            log.warning("Gemini 响应无法解析: %s | %s", e, str(res)[:300])
-            raise LLMError("返回内容无法解析") from e
+        return parse_gemini_response(resp.json(), "Gemini")
     raise LLMError("服务过载（503）")
 
 
 def call_opencode(user_prompt: str) -> dict:
-    """OpenCode Go 的 OpenAI 兼容接口。没有 responseSchema，靠 prompt 约束 JSON 结构。"""
     if not OPENCODE_API_KEY:
         raise LLMError("未配置 OPENCODE_API_KEY")
+    if OPENCODE_MODEL.startswith("gemini"):
+        return _opencode_google(user_prompt)
+    return _opencode_openai(user_prompt)
+
+
+def _opencode_google(user_prompt: str) -> dict:
+    """OpenCode Go 上的 Gemini 模型走 Google 原生 generateContent，可用 responseSchema 和思考等级。"""
+    payload = gemini_payload(user_prompt, OPENCODE_EFFORT or None)
+    headers = {"Authorization": f"Bearer {OPENCODE_API_KEY}", "Content-Type": "application/json"}
+    resp = None
+    for base in dict.fromkeys(OPENCODE_GOOGLE_BASES):
+        try:
+            resp = requests.post(
+                f"{base.rstrip('/')}/models/{OPENCODE_MODEL}:generateContent",
+                json=payload,
+                headers=headers,
+                timeout=OPENCODE_TIMEOUT,
+            )
+        except requests.Timeout as e:
+            raise LLMError("超时") from e
+        if resp.status_code != 404:  # 只有路径不对才换下一个地址
+            break
+        log.warning("OpenCode 地址 %s 返回 404，尝试下一个", base)
+    if resp.status_code != 200:
+        log.warning("OpenCode 失败 %s: %s", resp.status_code, resp.text[:300])
+        raise LLMError(_http_reason(resp.status_code))
+    return parse_gemini_response(resp.json(), "OpenCode")
+
+
+def _opencode_openai(user_prompt: str) -> dict:
+    """OpenCode Go 的 OpenAI 兼容接口（GLM/Kimi/DeepSeek 等）。没有 responseSchema，靠 prompt 约束 JSON 结构。"""
     schema_hint = (
         "\n\n只输出一个 JSON 对象，不要任何解释文字，结构必须符合以下 JSON Schema：\n"
         + json.dumps(RESPONSE_SCHEMA, ensure_ascii=False)
     )
+    body = {
+        "model": OPENCODE_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": user_prompt + schema_hint},
+        ],
+        "max_tokens": 8192,
+    }
+    if OPENCODE_EFFORT:
+        body["reasoning_effort"] = OPENCODE_EFFORT
     try:
         resp = requests.post(
-            f"{OPENCODE_BASE_URL.rstrip('/')}/chat/completions",
+            f"{OPENCODE_OPENAI_BASE.rstrip('/')}/chat/completions",
             headers={"Authorization": f"Bearer {OPENCODE_API_KEY}"},
-            json={
-                "model": OPENCODE_MODEL,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": user_prompt + schema_hint},
-                ],
-                "max_tokens": 8192,
-            },
-            timeout=LLM_TIMEOUT,
+            json=body,
+            timeout=OPENCODE_TIMEOUT,
         )
     except requests.Timeout as e:
         raise LLMError("超时") from e
