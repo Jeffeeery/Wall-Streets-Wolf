@@ -194,6 +194,7 @@ def test_gemini_failure_switches_to_opencode_gemini_4_argon(env):
     assert url1 == "https://opencode.ai/inference/go/google/v1beta/models/gemini-4-argon:generateContent"
     assert url2 == "https://opencode.ai/inference/go/v1/models/gemini-4-argon:generateContent"
     assert headers["Authorization"] == "Bearer oc-key"
+    assert headers["x-opencode-session"].startswith("marcus-")  # 缺这个头会 400 MissingSessionID
     assert body["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "high"}
     assert body["generationConfig"]["responseSchema"]  # Google 原生接口可用结构化输出
     assert "🔴 <b>NVDA</b>" in calls["tg"][0]["text"]  # 备用模型的结果照常经过引用校验和渲染
@@ -210,6 +211,7 @@ def test_opencode_openai_compatible_models(env, monkeypatch):
     url, body, headers = calls["opencode"][0]
     assert url == "https://opencode.ai/inference/go/openai/v1/chat/completions"
     assert body["model"] == "glm-5.1" and body["reasoning_effort"] == "high"
+    assert headers["x-opencode-session"].startswith("marcus-")
     assert "JSON Schema" in body["messages"][1]["content"]
 
 
