@@ -11,7 +11,8 @@ const chartOpts = { revalidateOnFocus: false, dedupingInterval: 600_000 };
 
 /** 近 30 根收盘价的走势线 */
 function Spark({ symbol }: { symbol: string }) {
-  const { data } = useSWR(["chart", symbol], () => fetchChartData(symbol), chartOpts);
+  // 与走势图的日线共用同一个缓存键
+  const { data } = useSWR(["chart", symbol, "D"], () => fetchChartData(symbol, "D"), chartOpts);
   const c = data?.candles.slice(-30).map((k) => k.close) ?? [];
   if (c.length < 2) return <span className="spark-empty" />;
   const w = 100, h = 26, lo = Math.min(...c), hi = Math.max(...c), k = hi - lo || 1;

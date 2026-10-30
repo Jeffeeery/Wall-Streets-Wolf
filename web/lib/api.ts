@@ -1,6 +1,7 @@
 import type {
   MarketSnapshot,
   ChartData,
+  Timeframe,
   MarcusMemory,
   WatchlistResponse,
   HistoryResponse,
@@ -16,8 +17,8 @@ async function get<T>(path: string): Promise<T> {
 
 export const fetchSnapshot = () => get<MarketSnapshot>("/api/snapshot");
 
-export const fetchChartData = (symbol: string) =>
-  get<ChartData>(`/api/chart/${encodeURIComponent(symbol)}`);
+export const fetchChartData = (symbol: string, tf: Timeframe = "D") =>
+  get<ChartData>(`/api/chart/${encodeURIComponent(symbol)}?tf=${tf}`);
 
 export const fetchMemory = () => get<MarcusMemory>("/api/memory");
 

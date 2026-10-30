@@ -22,15 +22,13 @@ export interface Candle {
   volume: number;
 }
 
-export interface RsiPoint {
-  time: number;
-  value: number;
-}
+/** 与后端 CHART_TIMEFRAMES、Vela 的 timeframe 写法一致 */
+export type Timeframe = "15" | "60" | "D" | "W";
 
 export interface ChartData {
   symbol: string;
+  tf: Timeframe;
   candles: Candle[];
-  rsi: RsiPoint[];
 }
 
 export type Direction = "BULLISH" | "BEARISH" | "NEUTRAL";

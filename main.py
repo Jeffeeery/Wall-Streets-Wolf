@@ -796,31 +796,42 @@ def update_watchlist(body: WatchlistBody):
         raise HTTPException(status_code=503, detail="Failed to save watchlist")
 
 
+# 走势图周期 → (Yahoo interval, range)。Yahoo 的分钟线最多回溯 60 天，小时线 730 天
+CHART_TIMEFRAMES = {
+    "15": ("15m", "60d"),
+    "60": ("1h",  "1y"),
+    "D":  ("1d",  "2y"),
+    "W":  ("1wk", "10y"),
+}
+
+
 @app.get("/api/chart/{symbol}")
-def get_chart_data(symbol: str):
+def get_chart_data(symbol: str, tf: str = "D"):
+    if tf not in CHART_TIMEFRAMES:
+        raise HTTPException(status_code=422, detail=f"tf must be one of {list(CHART_TIMEFRAMES)}")
     try:
         # watchlist read is the only Redis call here — no caching of chart data
         if symbol not in load_watchlist():
             raise HTTPException(status_code=404, detail=f"{symbol} not in watchlist")
 
+        interval, range_ = CHART_TIMEFRAMES[tf]
         url = (
             f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
-            f"?range=90d&interval=1d"
+            f"?range={range_}&interval={interval}"
         )
         res = requests.get(
             url, headers=QuantDataEngine.HEADERS, timeout=10
         ).json()
         result = res["chart"]["result"][0]
-        timestamps = result["timestamp"]
+        timestamps = result.get("timestamp") or []
         quote = result["indicators"]["quote"][0]
-        opens   = quote.get("open",   [None] * len(timestamps))
+        opens   = quote.get("open",   [])
         highs   = quote.get("high",   [])
         lows    = quote.get("low",    [])
         closes  = quote.get("close",  [])
         volumes = quote.get("volume", [])
 
         candles = []
-        clean_closes = []
         for i, ts in enumerate(timestamps):
             c = closes[i] if i < len(closes) else None
             raw_o = opens[i] if i < len(opens) else None
@@ -838,21 +849,13 @@ def get_chart_data(symbol: str):
                 "close":  round(float(c), 4),
                 "volume": int(v or 0),
             })
-            clean_closes.append(float(c))
 
-        rsi_series = []
-        for i in range(len(candles)):
-            if i < 14:
-                continue
-            rsi_val = calculate_rsi(clean_closes[: i + 1])
-            rsi_series.append({"time": candles[i]["time"], "value": rsi_val})
-
-        return {"symbol": symbol, "candles": candles, "rsi": rsi_series}
+        return {"symbol": symbol, "tf": tf, "candles": candles}
 
     except HTTPException:
         raise
     except Exception:
-        log.error("get_chart_data 异常 [%s]:\n%s", symbol, tb.format_exc())
+        log.error("get_chart_data 异常 [%s %s]:\n%s", symbol, tf, tb.format_exc())
         raise HTTPException(status_code=502, detail="Upstream data fetch failed")
 
 
