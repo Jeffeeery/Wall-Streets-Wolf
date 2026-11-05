@@ -23,7 +23,6 @@ from upstash_redis import Redis
 # ==========================================
 # 1. 环境变量
 # ==========================================
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 TG_TOKEN       = os.environ.get("TG_TOKEN")
 TG_CHAT_ID     = os.environ.get("TG_CHAT_ID")
@@ -38,11 +37,15 @@ WATCHLIST = ["^GSPC", "CL=F", "GC=F", "NVDA", "AAPL", "^VIX", "BTC-USD"]
 # Yahoo Finance 代码：NVDA / ^GSPC / CL=F / BTC-USD / 0700.HK / EURUSD=X
 YAHOO_SYMBOL_RE = re.compile(r"\^?[A-Z0-9][A-Z0-9.\-]{0,14}(=[FX])?")
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-# Gemini 失败时的备用：OpenCode Go。gemini-* 模型走 Google 原生接口，其余走 OpenAI 兼容接口
-OPENCODE_API_KEY  = os.environ.get("OPENCODE_API_KEY", "")
-OPENCODE_MODEL    = os.environ.get("OPENCODE_MODEL", "gemini-4-argon")
-OPENCODE_EFFORT   = os.environ.get("OPENCODE_EFFORT", "high")
+# 模型全部走 OpenCode Go：主模型失败就换备用模型。
+# gemini-* 走 Google 原生接口，其余（Kimi/DeepSeek/GLM…）走 OpenAI 兼容接口。
+# 主备特意选不同厂商：之前主备都跑在 Google 上，Google 一出问题两个一起挂（11-05 20:30）。
+OPENCODE_API_KEY        = os.environ.get("OPENCODE_API_KEY", "")
+OPENCODE_MODEL          = os.environ.get("OPENCODE_MODEL", "gemini-4-argon")
+OPENCODE_EFFORT         = os.environ.get("OPENCODE_EFFORT", "high")
+OPENCODE_FALLBACK_MODEL = os.environ.get("OPENCODE_FALLBACK_MODEL", "kimi-k3.1-pro")
+# 不确定备用模型是否接受 reasoning_effort，默认不传，避免它因为参数不认识直接 400
+OPENCODE_FALLBACK_EFFORT = os.environ.get("OPENCODE_FALLBACK_EFFORT", "")
 OPENCODE_GOOGLE_BASES = [  # 官方文档地址在前；另一条是社区验证过可用的路径
     os.environ.get("OPENCODE_GOOGLE_BASE_URL", "https://opencode.ai/inference/go/google/v1beta"),
     "https://opencode.ai/inference/go/v1",
@@ -306,12 +309,11 @@ SEARCH_ALIASES = {
 }
 TAVILY_MAX_RESULTS  = 4
 NEWS_CONTENT_CHARS  = 400
-GEMINI_RETRY_DELAY  = 5      # Gemini 临时过载（500/503）时等待后重试一次
-LLM_TIMEOUT         = 45
-OPENCODE_TIMEOUT    = 180    # 高思考等级更慢；与 Gemini 两次尝试合计仍在 Vercel 的 300s 以内
-GEMINI_MAX_TOKENS   = 8192
+# 主模型 + 备用模型 + 新闻检索合计要留在 Vercel 的 300s 以内
+PRIMARY_TIMEOUT     = 150    # 高思考等级更慢
+FALLBACK_TIMEOUT    = 120
 # 思考 token 也计入输出上限：high 思考等级下 8192 会把 JSON 截断（11-03/11-04 的"无法解析"）
-OPENCODE_MAX_TOKENS = 32768
+MAX_OUTPUT_TOKENS   = 32768
 
 
 MAX_RUNS = 30
@@ -428,21 +430,32 @@ class LLMError(RuntimeError):
     """模型调用失败，message 是给人看的简短原因（会出现在 Telegram 失败通知里）。"""
 
 
-def _http_reason(status: int) -> str:
-    return {
-        401: "key 无效（401）",
-        403: "无权限（403）",
-        404: "模型不存在（404）",
-        429: "配额用完或限流（429）",
-        500: "服务端错误（500）",
-        503: "服务过载（503）",
-    }.get(status, f"HTTP {status}")
+_STATUS_LABEL = {
+    401: "key 无效",
+    403: "无权限",
+    404: "模型不存在",
+    429: "限流或上游不可用",
+    500: "服务端错误",
+    503: "服务过载",
+}
 
 
-def gemini_payload(user_prompt: str, thinking_level: str | None = None,
-                   max_tokens: int = GEMINI_MAX_TOKENS) -> dict:
+def _http_reason(resp: requests.Response) -> str:
+    """状态码 + 服务商返回的原话。429 不一定是配额：11-05 那次其实是上游 Endpoint is unavailable。"""
+    label = _STATUS_LABEL.get(resp.status_code, "HTTP 错误")
+    try:
+        body = resp.json()
+        err  = body.get("error") if isinstance(body, dict) else None
+        detail = (err.get("message") if isinstance(err, dict) else err) or ""
+    except ValueError:
+        detail = resp.text
+    detail = re.sub(r"\s+", " ", str(detail)).strip()[:120]
+    return f"{label}（{resp.status_code}）" + (f"：{detail}" if detail else "")
+
+
+def gemini_payload(user_prompt: str, thinking_level: str | None = None) -> dict:
     config = {
-        "maxOutputTokens":  max_tokens,
+        "maxOutputTokens":  MAX_OUTPUT_TOKENS,
         "responseMimeType": "application/json",
         "responseSchema":   RESPONSE_SCHEMA,
     }
@@ -455,13 +468,13 @@ def gemini_payload(user_prompt: str, thinking_level: str | None = None,
     }
 
 
-def parse_gemini_response(res: dict, provider: str) -> dict:
+def parse_gemini_response(res: dict) -> dict:
     try:
         parts = res["candidates"][0]["content"]["parts"]
         text  = "".join(p.get("text", "") for p in parts if not p.get("thought"))
         return extract_json(text)
     except (KeyError, IndexError, ValueError) as e:
-        log.warning("%s 响应无法解析: %s | %s", provider, e, str(res)[:300])
+        log.warning("响应无法解析: %s | %s", e, str(res)[:300])
         raise LLMError(f"返回内容无法解析（{_gemini_diagnosis(res)}）") from e
 
 
@@ -476,31 +489,6 @@ def _gemini_diagnosis(res: dict) -> str:
     )
 
 
-def call_gemini(user_prompt: str) -> dict:
-    """不带工具调用 Gemini（免费版可用）。临时过载时等几秒重试一次。"""
-    payload = gemini_payload(user_prompt)
-    for attempt in range(2):
-        try:
-            resp = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=LLM_TIMEOUT,
-            )
-        except requests.Timeout as e:
-            raise LLMError("超时") from e
-        if resp.status_code in (500, 503) and attempt == 0:
-            log.warning("Gemini %s，%ss 后重试", resp.status_code, GEMINI_RETRY_DELAY)
-            time.sleep(GEMINI_RETRY_DELAY)
-            continue
-        if resp.status_code != 200:
-            log.warning("Gemini 失败 %s: %s", resp.status_code, resp.text[:300])
-            raise LLMError(_http_reason(resp.status_code))
-        return parse_gemini_response(resp.json(), "Gemini")
-    raise LLMError("服务过载（503）")
-
-
 def opencode_headers() -> dict:
     # OpenCode Go 要求每个请求带会话 ID，否则返回 400 MissingSessionID；每次运行一个新 ID
     return {
@@ -510,88 +498,95 @@ def opencode_headers() -> dict:
     }
 
 
-def call_opencode(user_prompt: str) -> dict:
+def call_opencode(user_prompt: str, model: str, effort: str, timeout: int) -> dict:
     if not OPENCODE_API_KEY:
         raise LLMError("未配置 OPENCODE_API_KEY")
-    if OPENCODE_MODEL.startswith("gemini"):
-        return _opencode_google(user_prompt)
-    return _opencode_openai(user_prompt)
+    if model.startswith("gemini"):
+        return _opencode_google(user_prompt, model, effort, timeout)
+    return _opencode_openai(user_prompt, model, effort, timeout)
 
 
-def _opencode_google(user_prompt: str) -> dict:
+def _opencode_google(user_prompt: str, model: str, effort: str, timeout: int) -> dict:
     """OpenCode Go 上的 Gemini 模型走 Google 原生 generateContent，可用 responseSchema 和思考等级。"""
-    payload = gemini_payload(user_prompt, OPENCODE_EFFORT or None, OPENCODE_MAX_TOKENS)
+    payload = gemini_payload(user_prompt, effort or None)
     headers = opencode_headers()
     resp = None
     for base in dict.fromkeys(OPENCODE_GOOGLE_BASES):
         try:
             resp = requests.post(
-                f"{base.rstrip('/')}/models/{OPENCODE_MODEL}:generateContent",
+                f"{base.rstrip('/')}/models/{model}:generateContent",
                 json=payload,
                 headers=headers,
-                timeout=OPENCODE_TIMEOUT,
+                timeout=timeout,
             )
         except requests.Timeout as e:
-            raise LLMError("超时") from e
+            raise LLMError(f"超时（{timeout}s）") from e
         if resp.status_code != 404:  # 只有路径不对才换下一个地址
             break
         log.warning("OpenCode 地址 %s 返回 404，尝试下一个", base)
     if resp.status_code != 200:
-        log.warning("OpenCode 失败 %s: %s", resp.status_code, resp.text[:300])
-        raise LLMError(_http_reason(resp.status_code))
-    return parse_gemini_response(resp.json(), "OpenCode")
+        log.warning("OpenCode %s 失败 %s: %s", model, resp.status_code, resp.text[:300])
+        raise LLMError(_http_reason(resp))
+    return parse_gemini_response(resp.json())
 
 
-def _opencode_openai(user_prompt: str) -> dict:
-    """OpenCode Go 的 OpenAI 兼容接口（GLM/Kimi/DeepSeek 等）。没有 responseSchema，靠 prompt 约束 JSON 结构。"""
+def _opencode_openai(user_prompt: str, model: str, effort: str, timeout: int) -> dict:
+    """OpenCode Go 的 OpenAI 兼容接口（Kimi/DeepSeek/GLM 等）。没有 responseSchema，靠 prompt 约束 JSON 结构。"""
     schema_hint = (
         "\n\n只输出一个 JSON 对象，不要任何解释文字，结构必须符合以下 JSON Schema：\n"
         + json.dumps(RESPONSE_SCHEMA, ensure_ascii=False)
     )
     body = {
-        "model": OPENCODE_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": user_prompt + schema_hint},
         ],
-        "max_tokens": 8192,
+        "max_tokens": MAX_OUTPUT_TOKENS,
     }
-    if OPENCODE_EFFORT:
-        body["reasoning_effort"] = OPENCODE_EFFORT
+    if effort:
+        body["reasoning_effort"] = effort
     try:
         resp = requests.post(
             f"{OPENCODE_OPENAI_BASE.rstrip('/')}/chat/completions",
             headers=opencode_headers(),
             json=body,
-            timeout=OPENCODE_TIMEOUT,
+            timeout=timeout,
         )
     except requests.Timeout as e:
-        raise LLMError("超时") from e
+        raise LLMError(f"超时（{timeout}s）") from e
     if resp.status_code != 200:
-        log.warning("OpenCode 失败 %s: %s", resp.status_code, resp.text[:300])
-        raise LLMError(_http_reason(resp.status_code))
+        log.warning("OpenCode %s 失败 %s: %s", model, resp.status_code, resp.text[:300])
+        raise LLMError(_http_reason(resp))
     res = resp.json()
     try:
-        text = res["choices"][0]["message"]["content"] or ""
+        choice = res["choices"][0]
+        text = choice["message"]["content"] or ""
         # 推理模型可能把思考过程放在 <think> 里，里面的花括号会干扰 JSON 提取
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
         return extract_json(text)
     except (KeyError, IndexError, TypeError, ValueError) as e:
-        log.warning("OpenCode 响应无法解析: %s | %s", e, str(res)[:300])
-        raise LLMError("返回内容无法解析") from e
+        log.warning("OpenCode %s 响应无法解析: %s | %s", model, e, str(res)[:300])
+        finish = ((res.get("choices") or [{}])[0] or {}).get("finish_reason", "?")
+        raise LLMError(f"返回内容无法解析（finish_reason={finish}）") from e
 
 
 def summarize(user_prompt: str) -> tuple[dict, str]:
-    """Gemini 优先，失败直接切 OpenCode。返回 (简报, 实际使用的模型)；都失败时原因合并抛出。"""
+    """主模型优先，失败换备用模型。返回 (简报, 实际使用的模型)；都失败时原因合并抛出。"""
     try:
-        return call_gemini(user_prompt), GEMINI_MODEL
+        return call_opencode(user_prompt, OPENCODE_MODEL, OPENCODE_EFFORT, PRIMARY_TIMEOUT), OPENCODE_MODEL
     except LLMError as e:
-        gemini_err = str(e)
-        log.warning("Gemini 不可用（%s），切换到 OpenCode %s", gemini_err, OPENCODE_MODEL)
+        primary_err = str(e)
+        log.warning("%s 不可用（%s），切换到 %s", OPENCODE_MODEL, primary_err, OPENCODE_FALLBACK_MODEL)
+    if not OPENCODE_FALLBACK_MODEL:
+        raise LLMError(f"{OPENCODE_MODEL} {primary_err}")
     try:
-        return call_opencode(user_prompt), f"opencode/{OPENCODE_MODEL}"
+        return (
+            call_opencode(user_prompt, OPENCODE_FALLBACK_MODEL, OPENCODE_FALLBACK_EFFORT, FALLBACK_TIMEOUT),
+            OPENCODE_FALLBACK_MODEL,
+        )
     except LLMError as e:
-        raise LLMError(f"Gemini {gemini_err}；OpenCode {e}") from e
+        raise LLMError(f"{OPENCODE_MODEL} {primary_err}；{OPENCODE_FALLBACK_MODEL} {e}") from e
 
 
 def extract_json(text: str) -> dict:
@@ -854,7 +849,7 @@ class MarcusAgent:
         # 3. Tavily 检索新闻
         news = collect_news(build_queries(watchlist, market)) if TAVILY_API_KEY else []
 
-        # 4. 模型只做总结：Gemini 优先，失败切 OpenCode
+        # 4. 模型只做总结：主模型优先，失败换备用模型
         brief: dict | None = None
         model_used = ""
         error = ""
@@ -1077,8 +1072,8 @@ def health_check():
         last_run = None
     return {
         "status":   "Marcus Wolf Online",
-        "model":    GEMINI_MODEL,
-        "fallback": f"opencode/{OPENCODE_MODEL}" if OPENCODE_API_KEY else None,
+        "model":    OPENCODE_MODEL,
+        "fallback": OPENCODE_FALLBACK_MODEL or None,
         "last_run": last_run,
         "version":  "3.1",
     }

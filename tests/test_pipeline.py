@@ -92,7 +92,7 @@ def env(monkeypatch):
     monkeypatch.setattr(main, "TAVILY_API_KEY", "tvly")
     monkeypatch.setattr(main, "OPENCODE_API_KEY", "oc-key")
     monkeypatch.setattr(main.time, "sleep", lambda s: None)
-    calls = {"tg": [], "sb": [], "gemini": [], "tavily": [], "gemini_resps": [], "opencode": [], "opencode_resps": []}
+    calls = {"tg": [], "sb": [], "tavily": [], "opencode": [], "opencode_resps": []}
 
     def fake_get(url, **kw):
         return Resp(yahoo_payload())
@@ -101,9 +101,7 @@ def env(monkeypatch):
         if "tavily" in url:
             calls["tavily"].append(json)
             return Resp({"results": tavily_results(json["query"])})
-        if "generativelanguage" in url:
-            calls["gemini"].append((url, json))
-            return calls["gemini_resps"].pop(0)
+        assert "generativelanguage" not in url  # Gemini 免费 API 已停用
         if "opencode.ai" in url:
             calls["opencode"].append((url, json, kw.get("headers")))
             return calls["opencode_resps"].pop(0)
@@ -120,10 +118,10 @@ def env(monkeypatch):
 
 def test_full_run(env):
     redis, calls = env
-    calls["gemini_resps"] = [gemini_resp(BRIEF)]
+    calls["opencode_resps"] = [gemini_resp(BRIEF)]
 
     msg = main.MarcusAgent.execute_and_send()
-    assert "检索 2 条 / 引用 2 条" in msg and main.GEMINI_MODEL in msg
+    assert "检索 2 条 / 引用 2 条" in msg and "gemini-4-argon" in msg
 
     # Tavily：4 条宏观 + 每个品种 1 条，先限定主流媒体，搜不到再放开
     first = [q for q in calls["tavily"] if q.get("include_domains")]
@@ -135,8 +133,8 @@ def test_full_run(env):
     queries = [q["query"] for q in first]
     assert any("NVIDIA Corporation (NVDA)" in q for q in queries) and any("S&P 500" in q for q in queries)
 
-    # Gemini：不带搜索工具，结构化输出，检索结果带编号进入 prompt
-    _, payload = calls["gemini"][0]
+    # 主模型 Gemini 4 Argon：结构化输出，检索结果带编号进入 prompt
+    _, payload, _ = calls["opencode"][0]
     assert "tools" not in payload and payload["generationConfig"]["responseSchema"]
     prompt = payload["contents"][0]["parts"][0]["text"]
     assert "[S1] (2026-10-30) Fed holds rates" in prompt and "[S2]" in prompt and "[S3]" not in prompt
@@ -160,9 +158,9 @@ def test_full_run(env):
     # 第二次运行：上期要点和方向带进 prompt，方向变化被标注
     flipped = dict(BRIEF, outlook=[{"symbol": "NVDA", "direction": "BULLISH", "confidence": "LOW",
                                     "drivers": "限制传闻被否认", "sources": ["S2"]}])
-    calls["gemini_resps"] = [gemini_resp(flipped)]
+    calls["opencode_resps"] = [gemini_resp(flipped)]
     main.MarcusAgent.execute_and_send()
-    prompt2 = calls["gemini"][1][1]["contents"][0]["parts"][0]["text"]
+    prompt2 = calls["opencode"][1][1]["contents"][0]["parts"][0]["text"]
     assert "美联储维持利率不变" in prompt2 and "NVDA 利空" in prompt2
     assert "🟢 <b>NVDA</b> 利好（低） 🔄 前次利空" in calls["tg"][1]["text"]
 
@@ -176,19 +174,11 @@ def opencode_resp(brief, status=200, think=False):
     return Resp({"choices": [{"message": {"content": text}}]})
 
 
-def test_gemini_503_retries_once_then_succeeds(env):
+def test_argon_request_shape(env):
     redis, calls = env
-    calls["gemini_resps"] = [gemini_resp(None, 503), gemini_resp(BRIEF)]
-    msg = main.MarcusAgent.execute_and_send()
-    assert main.GEMINI_MODEL in msg and len(calls["gemini"]) == 2 and calls["opencode"] == []
-
-
-def test_gemini_failure_switches_to_opencode_gemini_4_argon(env):
-    redis, calls = env
-    calls["gemini_resps"] = [gemini_resp(None, 429)]  # 配额用完不重试，直接切换
     calls["opencode_resps"] = [Resp({"error": "not found"}, 404), gemini_resp(BRIEF)]  # 第一个地址 404 → 换下一个
     msg = main.MarcusAgent.execute_and_send()
-    assert "opencode/gemini-4-argon" in msg and len(calls["gemini"]) == 1
+    assert "gemini-4-argon" in msg
 
     (url1, _, _), (url2, body, headers) = calls["opencode"]
     assert url1 == "https://opencode.ai/inference/go/google/v1beta/models/gemini-4-argon:generateContent"
@@ -198,32 +188,39 @@ def test_gemini_failure_switches_to_opencode_gemini_4_argon(env):
     assert body["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "high"}
     assert body["generationConfig"]["maxOutputTokens"] == 32768  # 给思考 token 留足空间
     assert body["generationConfig"]["responseSchema"]  # Google 原生接口可用结构化输出
-    assert "🔴 <b>NVDA</b>" in calls["tg"][0]["text"]  # 备用模型的结果照常经过引用校验和渲染
     run = json.loads(redis.store["marcus_runs"])[0]
-    assert run["ok"] is True and run["model"] == "opencode/gemini-4-argon" and run["source"] == "manual"
+    assert run["ok"] is True and run["model"] == "gemini-4-argon" and run["source"] == "manual"
 
 
-def test_opencode_openai_compatible_models(env, monkeypatch):
+def test_argon_failure_switches_to_kimi(env):
     redis, calls = env
-    monkeypatch.setattr(main, "OPENCODE_MODEL", "glm-5.1")
-    calls["gemini_resps"] = [gemini_resp(None, 429)]
-    calls["opencode_resps"] = [opencode_resp(BRIEF, think=True)]
+    calls["opencode_resps"] = [
+        Resp({"error": {"code": 429, "message": "Upstream request failed: Endpoint is unavailable."}}, 429),
+        opencode_resp(BRIEF, think=True),
+    ]
     msg = main.MarcusAgent.execute_and_send()
-    assert "opencode/glm-5.1" in msg
-    url, body, headers = calls["opencode"][0]
+    assert "kimi-k3.1-pro" in msg
+
+    url, body, headers = calls["opencode"][1]
     assert url == "https://opencode.ai/inference/go/openai/v1/chat/completions"
-    assert body["model"] == "glm-5.1" and body["reasoning_effort"] == "high"
+    assert body["model"] == "kimi-k3.1-pro" and "reasoning_effort" not in body
+    assert body["max_tokens"] == 32768
     assert headers["x-opencode-session"].startswith("marcus-")
     assert "JSON Schema" in body["messages"][1]["content"]
+    assert "🔴 <b>NVDA</b>" in calls["tg"][0]["text"]  # 备用模型的结果照常经过引用校验和渲染
+    assert json.loads(redis.store["marcus_runs"])[0]["model"] == "kimi-k3.1-pro"
 
 
-def test_all_models_fail_reports_reason_and_keeps_memory(env):
+def test_both_models_fail_quotes_provider_messages_and_keeps_memory(env):
     redis, calls = env
     redis.store["marcus_memory"] = json.dumps({"time": "t", "conclusion": "上期"})
-    calls["gemini_resps"] = [gemini_resp(None, 503), gemini_resp(None, 503)]
-    calls["opencode_resps"] = [Resp({"error": "bad key"}, 401)]
+    calls["opencode_resps"] = [
+        Resp({"error": {"code": 429, "message": "Upstream request failed: Endpoint is unavailable."}}, 429),
+        Resp({"error": {"message": "invalid api key"}}, 401),
+    ]
     msg = main.MarcusAgent.execute_and_send()
-    reason = "Gemini 服务过载（503）；OpenCode key 无效（401）"
+    reason = ("gemini-4-argon 限流或上游不可用（429）：Upstream request failed: Endpoint is unavailable.；"
+              "kimi-k3.1-pro key 无效（401）：invalid api key")
     assert reason in msg and reason in calls["tg"][0]["text"]
     assert json.loads(redis.store["marcus_memory"])["conclusion"] == "上期"
     assert calls["sb"] == []
@@ -234,16 +231,16 @@ def test_all_models_fail_reports_reason_and_keeps_memory(env):
 def test_opencode_not_configured(env, monkeypatch):
     redis, calls = env
     monkeypatch.setattr(main, "OPENCODE_API_KEY", "")
-    calls["gemini_resps"] = [gemini_resp(None, 404)]
     msg = main.MarcusAgent.execute_and_send()
-    assert "Gemini 模型不存在（404）；OpenCode 未配置 OPENCODE_API_KEY" in msg
+    assert "gemini-4-argon 未配置 OPENCODE_API_KEY；kimi-k3.1-pro 未配置 OPENCODE_API_KEY" in msg
+    assert calls["opencode"] == []
 
 
 def test_no_news_skips_gemini(env, monkeypatch):
     redis, calls = env
     monkeypatch.setattr(main, "tavily_search", lambda q, t="day": [])
     msg = main.MarcusAgent.execute_and_send()
-    assert "新闻检索失败" in msg and calls["gemini"] == [] and "新闻检索失败" in calls["tg"][0]["text"]
+    assert "新闻检索失败" in msg and calls["opencode"] == [] and "新闻检索失败" in calls["tg"][0]["text"]
 
     monkeypatch.setattr(main, "TAVILY_API_KEY", "")
     assert "未配置 TAVILY_API_KEY" in main.MarcusAgent.execute_and_send()
@@ -349,12 +346,14 @@ def test_chart_timeframes(monkeypatch):
 
 def test_truncated_opencode_reports_finish_reason(env):
     redis, calls = env
-    calls["gemini_resps"] = [gemini_resp(None, 503), gemini_resp(None, 503)]
     truncated = {"candidates": [{"content": {"parts": [{"text": '{"headline": "半截'}]}, "finishReason": "MAX_TOKENS"}],
                  "usageMetadata": {"thoughtsTokenCount": 7900, "candidatesTokenCount": 292}}
-    calls["opencode_resps"] = [Resp(truncated)]
+    kimi_truncated = Resp({"choices": [{"message": {"content": '{"headline": "半截'}, "finish_reason": "length"}]})
+    calls["opencode_resps"] = [Resp(truncated), kimi_truncated]
     msg = main.MarcusAgent.execute_and_send()
-    assert "OpenCode 返回内容无法解析（finishReason=MAX_TOKENS，思考 7900 / 输出 292 token）" in calls["tg"][0]["text"]
+    text = calls["tg"][0]["text"]
+    assert "gemini-4-argon 返回内容无法解析（finishReason=MAX_TOKENS，思考 7900 / 输出 292 token）" in text
+    assert "kimi-k3.1-pro 返回内容无法解析（finish_reason=length）" in text
     assert "MAX_TOKENS" in msg
 
 
@@ -363,7 +362,7 @@ def test_run_log_keeps_last_30_and_marks_cron(env, monkeypatch):
     redis, calls = env
     redis.store["marcus_runs"] = json.dumps([{"time": f"old-{i}", "ok": True} for i in range(30)])
     monkeypatch.setattr(main, "CRON_SECRET", "s3")
-    calls["gemini_resps"] = [gemini_resp(BRIEF)]
+    calls["opencode_resps"] = [gemini_resp(BRIEF)]
     client = TestClient(main.app)
 
     r = client.get("/api/trigger-analysis", headers={"Authorization": "Bearer s3", "User-Agent": "vercel-cron/1.0"})
@@ -371,7 +370,7 @@ def test_run_log_keeps_last_30_and_marks_cron(env, monkeypatch):
     runs = json.loads(redis.store["marcus_runs"])
     assert len(runs) == 30 and runs[-1]["time"] == "old-28"  # 最旧的一条被挤掉
     new = runs[0]
-    assert new["source"] == "cron" and new["ok"] is True and new["model"] == main.GEMINI_MODEL
+    assert new["source"] == "cron" and new["ok"] is True and new["model"] == "gemini-4-argon"
     assert new["news"] == 2 and new["cited"] == 2 and isinstance(new["seconds"], int)
 
     body = client.get("/api/runs?limit=5").json()
