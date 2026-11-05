@@ -534,8 +534,15 @@ def _opencode_google(user_prompt: str, model: str, effort: str, timeout: int) ->
     return parse_gemini_response(resp.json())
 
 
+STREAM_IDLE_TIMEOUT = 60   # 流式响应超过这么久没有任何新数据就放弃
+
+
 def _opencode_openai(user_prompt: str, model: str, effort: str, timeout: int) -> dict:
-    """OpenCode Go 的 OpenAI 兼容接口（Kimi/DeepSeek/GLM 等）。没有 responseSchema，靠 prompt 约束 JSON 结构。"""
+    """OpenCode Go 的 OpenAI 兼容接口（Kimi/DeepSeek/GLM 等）。没有 responseSchema，靠 prompt 约束 JSON 结构。
+
+    用流式接收：一次性等完整响应时，超时只能知道"没回来"；流式能看到模型是在思考、
+    在写正文还是完全没动静，失败原因里会写出来（11-06 Kimi 两次超时都分不清是哪种）。
+    """
     schema_hint = (
         "\n\n只输出一个 JSON 对象，不要任何解释文字，结构必须符合以下 JSON Schema：\n"
         + json.dumps(RESPONSE_SCHEMA, ensure_ascii=False)
@@ -547,32 +554,60 @@ def _opencode_openai(user_prompt: str, model: str, effort: str, timeout: int) ->
             {"role": "user",   "content": user_prompt + schema_hint},
         ],
         "max_tokens": MAX_OUTPUT_TOKENS,
+        "stream": True,
     }
     if effort:
         body["reasoning_effort"] = effort
+    deadline = time.monotonic() + timeout
     try:
         resp = requests.post(
             f"{OPENCODE_OPENAI_BASE.rstrip('/')}/chat/completions",
             headers=opencode_headers(),
             json=body,
-            timeout=timeout,
+            timeout=(10, min(timeout, STREAM_IDLE_TIMEOUT)),
+            stream=True,
         )
     except requests.Timeout as e:
-        raise LLMError(f"超时（{timeout}s）") from e
+        raise LLMError(f"超时（{timeout}s，连接后无响应）") from e
     if resp.status_code != 200:
         log.warning("OpenCode %s 失败 %s: %s", model, resp.status_code, resp.text[:300])
         raise LLMError(_http_reason(resp))
-    res = resp.json()
+
+    content, reasoning_chars, finish = [], 0, None
     try:
-        choice = res["choices"][0]
-        text = choice["message"]["content"] or ""
-        # 推理模型可能把思考过程放在 <think> 里，里面的花括号会干扰 JSON 提取
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+        for raw in resp.iter_lines(decode_unicode=True):
+            if time.monotonic() > deadline:
+                raise LLMError(
+                    f"超时（{timeout}s，已收到思考 {reasoning_chars} 字 / 正文 {sum(map(len, content))} 字）"
+                )
+            if not raw or not raw.startswith("data:"):
+                continue
+            data = raw[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                continue
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or {}
+                content.append(delta.get("content") or "")
+                reasoning_chars += len(delta.get("reasoning_content") or delta.get("reasoning") or "")
+                finish = choice.get("finish_reason") or finish
+    except requests.exceptions.RequestException as e:  # 包括流中途长时间没数据
+        raise LLMError(
+            f"超时（流中断，已收到思考 {reasoning_chars} 字 / 正文 {sum(map(len, content))} 字）"
+        ) from e
+    finally:
+        resp.close()
+
+    # 推理模型可能把思考过程放在 <think> 里，里面的花括号会干扰 JSON 提取
+    text = re.sub(r"<think>.*?</think>", "", "".join(content), flags=re.S)
+    try:
         return extract_json(text)
-    except (KeyError, IndexError, TypeError, ValueError) as e:
-        log.warning("OpenCode %s 响应无法解析: %s | %s", model, e, str(res)[:300])
-        finish = ((res.get("choices") or [{}])[0] or {}).get("finish_reason", "?")
-        raise LLMError(f"返回内容无法解析（finish_reason={finish}）") from e
+    except ValueError as e:
+        log.warning("OpenCode %s 响应无法解析: %s | %s", model, e, text[:300])
+        raise LLMError(f"返回内容无法解析（finish_reason={finish or '?'}，正文 {len(text)} 字）") from e
 
 
 def summarize(user_prompt: str) -> tuple[dict, str]:

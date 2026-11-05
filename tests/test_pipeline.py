@@ -29,6 +29,23 @@ class Resp:
         if self.status_code >= 400:
             raise RuntimeError(self.status_code)
 
+    def close(self):
+        pass
+
+
+class StreamResp(Resp):
+    """OpenAI 兼容接口的流式（SSE）响应。"""
+
+    def __init__(self, deltas, finish="stop"):
+        super().__init__({})
+        self.lines = []
+        for d in deltas:
+            self.lines += ["data: " + json.dumps({"choices": [{"delta": d}]}, ensure_ascii=False), ""]
+        self.lines += ["data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": finish}]}), "", "data: [DONE]"]
+
+    def iter_lines(self, decode_unicode=False):
+        return iter(self.lines)
+
 
 def yahoo_payload(n=250, base=100):
     closes = [base + 5 * math.sin(i / 7) + i * 0.05 for i in range(n)]
@@ -169,9 +186,13 @@ def opencode_resp(brief, status=200, think=False):
     if status != 200:
         return Resp({"error": {"message": "nope"}}, status)
     text = json.dumps(brief, ensure_ascii=False)
+    deltas = [{"reasoning_content": "先读一遍新闻……"}]
     if think:
         text = "<think>先想想 {不是 JSON}</think>\n```json\n" + text + "\n```"
-    return Resp({"choices": [{"message": {"content": text}}]})
+    # 分几段流式返回，模拟逐 token 输出
+    step = max(1, len(text) // 4)
+    deltas += [{"content": text[i:i + step]} for i in range(0, len(text), step)]
+    return StreamResp(deltas)
 
 
 def test_argon_request_shape(env):
@@ -204,7 +225,7 @@ def test_argon_failure_switches_to_kimi(env):
     url, body, headers = calls["opencode"][1]
     assert url == "https://opencode.ai/inference/go/openai/v1/chat/completions"
     assert body["model"] == "kimi-k3.1-pro" and "reasoning_effort" not in body
-    assert body["max_tokens"] == 32768
+    assert body["max_tokens"] == 32768 and body["stream"] is True
     assert headers["x-opencode-session"].startswith("marcus-")
     assert "JSON Schema" in body["messages"][1]["content"]
     assert "🔴 <b>NVDA</b>" in calls["tg"][0]["text"]  # 备用模型的结果照常经过引用校验和渲染
@@ -371,12 +392,12 @@ def test_truncated_opencode_reports_finish_reason(env):
     redis, calls = env
     truncated = {"candidates": [{"content": {"parts": [{"text": '{"headline": "半截'}]}, "finishReason": "MAX_TOKENS"}],
                  "usageMetadata": {"thoughtsTokenCount": 7900, "candidatesTokenCount": 292}}
-    kimi_truncated = Resp({"choices": [{"message": {"content": '{"headline": "半截'}, "finish_reason": "length"}]})
+    kimi_truncated = StreamResp([{"content": '{"headline": "半截'}], finish="length")
     calls["opencode_resps"] = [Resp(truncated), kimi_truncated]
     msg = main.MarcusAgent.execute_and_send()
     text = calls["tg"][0]["text"]
     assert "gemini-4-argon 返回内容无法解析（finishReason=MAX_TOKENS，思考 7900 / 输出 292 token）" in text
-    assert "kimi-k3.1-pro 返回内容无法解析（finish_reason=length）" in text
+    assert "kimi-k3.1-pro 返回内容无法解析（finish_reason=length，正文 16 字）" in text
     assert "MAX_TOKENS" in msg
 
 
@@ -413,3 +434,15 @@ def test_crash_is_recorded(env, monkeypatch):
     assert r.json()["status"] == "Failed"
     run = json.loads(redis.store["marcus_runs"])[0]
     assert run["ok"] is False and run["source"] == "manual" and "ValueError: redis down" in run["error"]
+
+
+def test_kimi_stream_timeout_reports_progress(env, monkeypatch):
+    redis, calls = env
+    clock = iter([0.0, 0.0] + [0.0, 1.0, 2.0, 999.0] + [999.0] * 20)
+    monkeypatch.setattr(main.time, "monotonic", lambda: next(clock))
+    calls["opencode_resps"] = [
+        Resp({"error": {"message": "Upstream request failed: Endpoint is unavailable."}}, 429),
+        StreamResp([{"reasoning_content": "思考中" * 10}, {"reasoning_content": "还在想"}, {"content": "{"}]),
+    ]
+    msg = main.MarcusAgent.execute_and_send()
+    assert "kimi-k3.1-pro 超时（" in msg and "已收到思考 30 字 / 正文 0 字" in msg
