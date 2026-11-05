@@ -196,6 +196,7 @@ def test_gemini_failure_switches_to_opencode_gemini_4_argon(env):
     assert headers["Authorization"] == "Bearer oc-key"
     assert headers["x-opencode-session"].startswith("marcus-")  # 缺这个头会 400 MissingSessionID
     assert body["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "high"}
+    assert body["generationConfig"]["maxOutputTokens"] == 32768  # 给思考 token 留足空间
     assert body["generationConfig"]["responseSchema"]  # Google 原生接口可用结构化输出
     assert "🔴 <b>NVDA</b>" in calls["tg"][0]["text"]  # 备用模型的结果照常经过引用校验和渲染
     assert json.loads(redis.store["marcus_last_run"])["ok"] is True
@@ -343,3 +344,14 @@ def test_chart_timeframes(monkeypatch):
     assert "interval=15m" in urls[-1]
     assert client.get("/api/chart/NVDA?tf=5").status_code == 422
     assert client.get("/api/chart/AAPL").status_code == 404
+
+
+def test_truncated_opencode_reports_finish_reason(env):
+    redis, calls = env
+    calls["gemini_resps"] = [gemini_resp(None, 503), gemini_resp(None, 503)]
+    truncated = {"candidates": [{"content": {"parts": [{"text": '{"headline": "半截'}]}, "finishReason": "MAX_TOKENS"}],
+                 "usageMetadata": {"thoughtsTokenCount": 7900, "candidatesTokenCount": 292}}
+    calls["opencode_resps"] = [Resp(truncated)]
+    msg = main.MarcusAgent.execute_and_send()
+    assert "OpenCode 返回内容无法解析（finishReason=MAX_TOKENS，思考 7900 / 输出 292 token）" in calls["tg"][0]["text"]
+    assert "MAX_TOKENS" in msg

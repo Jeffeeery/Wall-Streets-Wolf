@@ -307,8 +307,11 @@ SEARCH_ALIASES = {
 TAVILY_MAX_RESULTS  = 4
 NEWS_CONTENT_CHARS  = 400
 GEMINI_RETRY_DELAY  = 5      # Gemini 临时过载（500/503）时等待后重试一次
-LLM_TIMEOUT         = 60
-OPENCODE_TIMEOUT    = 120    # 高思考等级更慢
+LLM_TIMEOUT         = 45
+OPENCODE_TIMEOUT    = 180    # 高思考等级更慢；与 Gemini 两次尝试合计仍在 Vercel 的 300s 以内
+GEMINI_MAX_TOKENS   = 8192
+# 思考 token 也计入输出上限：high 思考等级下 8192 会把 JSON 截断（11-03/11-04 的"无法解析"）
+OPENCODE_MAX_TOKENS = 32768
 
 
 def load_watchlist() -> list[str]:
@@ -419,9 +422,10 @@ def _http_reason(status: int) -> str:
     }.get(status, f"HTTP {status}")
 
 
-def gemini_payload(user_prompt: str, thinking_level: str | None = None) -> dict:
+def gemini_payload(user_prompt: str, thinking_level: str | None = None,
+                   max_tokens: int = GEMINI_MAX_TOKENS) -> dict:
     config = {
-        "maxOutputTokens":  8192,
+        "maxOutputTokens":  max_tokens,
         "responseMimeType": "application/json",
         "responseSchema":   RESPONSE_SCHEMA,
     }
@@ -441,7 +445,18 @@ def parse_gemini_response(res: dict, provider: str) -> dict:
         return extract_json(text)
     except (KeyError, IndexError, ValueError) as e:
         log.warning("%s 响应无法解析: %s | %s", provider, e, str(res)[:300])
-        raise LLMError("返回内容无法解析") from e
+        raise LLMError(f"返回内容无法解析（{_gemini_diagnosis(res)}）") from e
+
+
+def _gemini_diagnosis(res: dict) -> str:
+    """失败通知里附上截断原因和 token 用量，Vercel 日志过期后也能判断问题。"""
+    cand   = (res.get("candidates") or [{}])[0]
+    usage  = res.get("usageMetadata") or {}
+    reason = cand.get("finishReason") or (res.get("promptFeedback") or {}).get("blockReason") or "无候选结果"
+    return (
+        f"finishReason={reason}，思考 {usage.get('thoughtsTokenCount', '?')} / "
+        f"输出 {usage.get('candidatesTokenCount', '?')} token"
+    )
 
 
 def call_gemini(user_prompt: str) -> dict:
@@ -488,7 +503,7 @@ def call_opencode(user_prompt: str) -> dict:
 
 def _opencode_google(user_prompt: str) -> dict:
     """OpenCode Go 上的 Gemini 模型走 Google 原生 generateContent，可用 responseSchema 和思考等级。"""
-    payload = gemini_payload(user_prompt, OPENCODE_EFFORT or None)
+    payload = gemini_payload(user_prompt, OPENCODE_EFFORT or None, OPENCODE_MAX_TOKENS)
     headers = opencode_headers()
     resp = None
     for base in dict.fromkeys(OPENCODE_GOOGLE_BASES):
