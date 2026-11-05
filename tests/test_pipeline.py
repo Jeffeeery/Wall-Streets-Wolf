@@ -199,7 +199,8 @@ def test_gemini_failure_switches_to_opencode_gemini_4_argon(env):
     assert body["generationConfig"]["maxOutputTokens"] == 32768  # 给思考 token 留足空间
     assert body["generationConfig"]["responseSchema"]  # Google 原生接口可用结构化输出
     assert "🔴 <b>NVDA</b>" in calls["tg"][0]["text"]  # 备用模型的结果照常经过引用校验和渲染
-    assert json.loads(redis.store["marcus_last_run"])["ok"] is True
+    run = json.loads(redis.store["marcus_runs"])[0]
+    assert run["ok"] is True and run["model"] == "opencode/gemini-4-argon" and run["source"] == "manual"
 
 
 def test_opencode_openai_compatible_models(env, monkeypatch):
@@ -226,7 +227,7 @@ def test_all_models_fail_reports_reason_and_keeps_memory(env):
     assert reason in msg and reason in calls["tg"][0]["text"]
     assert json.loads(redis.store["marcus_memory"])["conclusion"] == "上期"
     assert calls["sb"] == []
-    last = json.loads(redis.store["marcus_last_run"])
+    last = json.loads(redis.store["marcus_runs"])[0]
     assert last["ok"] is False and reason in last["error"]
 
 
@@ -292,7 +293,7 @@ def test_clean_title_and_price_precision(env):
 
 def test_trigger_auth(monkeypatch):
     from fastapi.testclient import TestClient
-    monkeypatch.setattr(main.MarcusAgent, "execute_and_send", staticmethod(lambda: "ok"))
+    monkeypatch.setattr(main.MarcusAgent, "execute_and_send", staticmethod(lambda source="manual": "ok"))
     client = TestClient(main.app)
 
     monkeypatch.setattr(main, "CRON_SECRET", "")
@@ -355,3 +356,38 @@ def test_truncated_opencode_reports_finish_reason(env):
     msg = main.MarcusAgent.execute_and_send()
     assert "OpenCode 返回内容无法解析（finishReason=MAX_TOKENS，思考 7900 / 输出 292 token）" in calls["tg"][0]["text"]
     assert "MAX_TOKENS" in msg
+
+
+def test_run_log_keeps_last_30_and_marks_cron(env, monkeypatch):
+    from fastapi.testclient import TestClient
+    redis, calls = env
+    redis.store["marcus_runs"] = json.dumps([{"time": f"old-{i}", "ok": True} for i in range(30)])
+    monkeypatch.setattr(main, "CRON_SECRET", "s3")
+    calls["gemini_resps"] = [gemini_resp(BRIEF)]
+    client = TestClient(main.app)
+
+    r = client.get("/api/trigger-analysis", headers={"Authorization": "Bearer s3", "User-Agent": "vercel-cron/1.0"})
+    assert r.json()["status"] == "Success"
+    runs = json.loads(redis.store["marcus_runs"])
+    assert len(runs) == 30 and runs[-1]["time"] == "old-28"  # 最旧的一条被挤掉
+    new = runs[0]
+    assert new["source"] == "cron" and new["ok"] is True and new["model"] == main.GEMINI_MODEL
+    assert new["news"] == 2 and new["cited"] == 2 and isinstance(new["seconds"], int)
+
+    body = client.get("/api/runs?limit=5").json()
+    assert len(body["runs"]) == 5 and body["runs"][0]["source"] == "cron" and body["failed"] == 0
+
+
+def test_crash_is_recorded(env, monkeypatch):
+    from fastapi.testclient import TestClient
+    redis, calls = env
+    monkeypatch.setattr(main, "CRON_SECRET", "s3")
+
+    def boom(*a, **k):
+        raise ValueError("redis down")
+
+    monkeypatch.setattr(main, "load_watchlist", boom)
+    r = TestClient(main.app).get("/api/trigger-analysis?secret=s3")
+    assert r.json()["status"] == "Failed"
+    run = json.loads(redis.store["marcus_runs"])[0]
+    assert run["ok"] is False and run["source"] == "manual" and "ValueError: redis down" in run["error"]
