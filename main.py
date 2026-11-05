@@ -310,8 +310,12 @@ SEARCH_ALIASES = {
 TAVILY_MAX_RESULTS  = 4
 NEWS_CONTENT_CHARS  = 400
 # 主模型 + 备用模型 + 新闻检索合计要留在 Vercel 的 300s 以内
+# 模型阶段的总时间预算（Vercel 函数上限 300s，留出新闻检索和发送的时间）。
+# 主模型最多用 PRIMARY_TIMEOUT，备用模型拿走剩下的全部时间：
+# 主模型通常几秒就报错（429/503），这时备用有约 250s；Kimi K3.1 Pro 在 120s 内写不完（11-06 实测超时）
+LLM_BUDGET          = 260
 PRIMARY_TIMEOUT     = 150    # 高思考等级更慢
-FALLBACK_TIMEOUT    = 120
+MIN_FALLBACK_TIME   = 60
 # 思考 token 也计入输出上限：high 思考等级下 8192 会把 JSON 截断（11-03/11-04 的"无法解析"）
 MAX_OUTPUT_TOKENS   = 32768
 
@@ -573,6 +577,7 @@ def _opencode_openai(user_prompt: str, model: str, effort: str, timeout: int) ->
 
 def summarize(user_prompt: str) -> tuple[dict, str]:
     """主模型优先，失败换备用模型。返回 (简报, 实际使用的模型)；都失败时原因合并抛出。"""
+    started = time.monotonic()
     try:
         return call_opencode(user_prompt, OPENCODE_MODEL, OPENCODE_EFFORT, PRIMARY_TIMEOUT), OPENCODE_MODEL
     except LLMError as e:
@@ -580,9 +585,10 @@ def summarize(user_prompt: str) -> tuple[dict, str]:
         log.warning("%s 不可用（%s），切换到 %s", OPENCODE_MODEL, primary_err, OPENCODE_FALLBACK_MODEL)
     if not OPENCODE_FALLBACK_MODEL:
         raise LLMError(f"{OPENCODE_MODEL} {primary_err}")
+    fallback_timeout = max(MIN_FALLBACK_TIME, int(LLM_BUDGET - (time.monotonic() - started)))
     try:
         return (
-            call_opencode(user_prompt, OPENCODE_FALLBACK_MODEL, OPENCODE_FALLBACK_EFFORT, FALLBACK_TIMEOUT),
+            call_opencode(user_prompt, OPENCODE_FALLBACK_MODEL, OPENCODE_FALLBACK_EFFORT, fallback_timeout),
             OPENCODE_FALLBACK_MODEL,
         )
     except LLMError as e:

@@ -211,6 +211,29 @@ def test_argon_failure_switches_to_kimi(env):
     assert json.loads(redis.store["marcus_runs"])[0]["model"] == "kimi-k3.1-pro"
 
 
+def test_fallback_gets_remaining_budget(env, monkeypatch):
+    seen = []
+
+    def fake_call(prompt, model, effort, timeout):
+        seen.append((model, timeout))
+        if model == main.OPENCODE_MODEL:
+            raise main.LLMError("限流或上游不可用（429）")
+        return BRIEF
+
+    monkeypatch.setattr(main, "call_opencode", fake_call)
+    clock = iter([1000.0, 1003.0])  # 主模型 3 秒就失败
+    monkeypatch.setattr(main.time, "monotonic", lambda: next(clock))
+    brief, model = main.summarize("p")
+    assert model == "kimi-k3.1-pro"
+    assert seen == [("gemini-4-argon", 150), ("kimi-k3.1-pro", 257)]  # 备用拿走剩下的 257s
+
+    seen.clear()
+    clock = iter([1000.0, 1150.0])  # 主模型拖满 150 秒才失败
+    monkeypatch.setattr(main.time, "monotonic", lambda: next(clock))
+    main.summarize("p")
+    assert seen[1] == ("kimi-k3.1-pro", 110)
+
+
 def test_both_models_fail_quotes_provider_messages_and_keeps_memory(env):
     redis, calls = env
     redis.store["marcus_memory"] = json.dumps({"time": "t", "conclusion": "上期"})
