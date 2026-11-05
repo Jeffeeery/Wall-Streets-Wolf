@@ -314,6 +314,23 @@ GEMINI_MAX_TOKENS   = 8192
 OPENCODE_MAX_TOKENS = 32768
 
 
+MAX_RUNS = 30
+
+
+def record_run(entry: dict) -> None:
+    """把一次运行结果插到 marcus_runs 最前面，只保留最近 MAX_RUNS 次（Vercel 免费版日志只留 1 小时）。"""
+    try:
+        runs = json.loads(get_redis().get("marcus_runs") or "[]")
+        runs = [entry] + runs[: MAX_RUNS - 1]
+        get_redis().set("marcus_runs", json.dumps(runs, ensure_ascii=False))
+    except Exception:
+        log.error("记录运行结果失败:\n%s", tb.format_exc())
+
+
+def load_runs() -> list[dict]:
+    return json.loads(get_redis().get("marcus_runs") or "[]")
+
+
 def load_watchlist() -> list[str]:
     return json.loads(get_redis().get("marcus_watchlist") or "null") or WATCHLIST
 
@@ -812,9 +829,10 @@ def send_telegram(text: str) -> None:
 class MarcusAgent:
 
     @staticmethod
-    def execute_and_send() -> str:
+    def execute_and_send(source: str = "manual") -> str:
         tz  = pytz.timezone(TIMEZONE)
         now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+        started = time.monotonic()
 
         # 1. 拉取行情（只用于对照新闻解释涨跌 + 生成检索关键词）
         watchlist = load_watchlist()
@@ -896,14 +914,18 @@ class MarcusAgent:
                 "brief":         brief,
             })
 
-        # 6. 发送 Telegram，并记下本次运行结果（Vercel 免费版日志只留 1 小时）
+        # 6. 发送 Telegram，并记下本次运行结果
         send_telegram(tg_text)
-        try:
-            get_redis().set("marcus_last_run", json.dumps({
-                "time": now, "ok": bool(brief), "model": model_used, "error": error,
-            }, ensure_ascii=False))
-        except Exception:
-            log.error("记录运行结果失败:\n%s", tb.format_exc())
+        record_run({
+            "time":     now,
+            "source":   source,
+            "ok":       bool(brief),
+            "model":    model_used,
+            "error":    error,
+            "seconds":  round(time.monotonic() - started),
+            "news":     len(news),
+            "cited":    len(sources),
+        })
 
         return (
             f"报告已发送 | {now} | 资产覆盖: {list(market.keys())} | "
@@ -1026,6 +1048,17 @@ def get_snapshot():
         raise HTTPException(status_code=503, detail="Market data temporarily unavailable")
 
 
+@app.get("/api/runs")
+def get_runs(limit: int = MAX_RUNS):
+    """最近的运行记录（新的在前）：触发来源、成功与否、模型、失败原因、耗时。"""
+    try:
+        runs = load_runs()[: max(1, min(limit, MAX_RUNS))]
+    except Exception:
+        log.error("get_runs 异常:\n%s", tb.format_exc())
+        raise HTTPException(status_code=503, detail="Run log unavailable")
+    return {"runs": runs, "failed": sum(1 for r in runs if not r.get("ok"))}
+
+
 @app.get("/api/history")
 def get_history(limit: int = 30):
     try:
@@ -1039,7 +1072,7 @@ def get_history(limit: int = 30):
 @app.get("/")
 def health_check():
     try:
-        last_run = json.loads(get_redis().get("marcus_last_run") or "null")
+        last_run = (load_runs() or [None])[0]
     except Exception:
         last_run = None
     return {
@@ -1052,15 +1085,29 @@ def health_check():
 
 
 @app.get("/api/trigger-analysis")
-def trigger_analysis(secret: str = "", authorization: str = Header(default="")):
+def trigger_analysis(
+    secret: str = "",
+    authorization: str = Header(default=""),
+    user_agent: str = Header(default=""),
+):
     # 支持 ?secret= 和 Vercel Cron 自动附带的 Authorization: Bearer <CRON_SECRET>
     token = secret or authorization.removeprefix("Bearer ").strip()
     if not CRON_SECRET or not hmac.compare_digest(token, CRON_SECRET):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    # Vercel Cron 的 User-Agent 是 vercel-cron/1.0，借此区分定时触发和手动触发
+    source = "cron" if "vercel-cron" in user_agent.lower() else "manual"
     try:
-        result_msg = MarcusAgent.execute_and_send()
+        result_msg = MarcusAgent.execute_and_send(source)
         return {"status": "Success", "detail": result_msg}
-    except Exception:
+    except Exception as e:
         log.error("trigger_analysis 异常:\n%s", tb.format_exc())
+        tz = pytz.timezone(TIMEZONE)
+        record_run({
+            "time":   datetime.now(tz).strftime("%Y-%m-%d %H:%M"),
+            "source": source,
+            "ok":     False,
+            "model":  "",
+            "error":  f"程序异常：{type(e).__name__}: {str(e)[:200]}",
+        })
         return {"status": "Failed", "error": "内部错误，请查看服务端日志。"}
