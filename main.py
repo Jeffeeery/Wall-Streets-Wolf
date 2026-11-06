@@ -575,7 +575,10 @@ def _opencode_openai(user_prompt: str, model: str, effort: str, timeout: int) ->
 
     content, reasoning_chars, finish = [], 0, None
     try:
-        for raw in resp.iter_lines(decode_unicode=True):
+        # 按字节读再自己用 UTF-8 解码：SSE 的 Content-Type 通常不带 charset，
+        # requests 会按 HTTP 默认的 Latin-1 解码，中文全变成乱码（11-07 那条 Telegram）
+        for raw_bytes in resp.iter_lines():
+            raw = raw_bytes.decode("utf-8", errors="replace")
             if time.monotonic() > deadline:
                 raise LLMError(
                     f"超时（{timeout}s，已收到思考 {reasoning_chars} 字 / 正文 {sum(map(len, content))} 字）"

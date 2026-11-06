@@ -44,7 +44,11 @@ class StreamResp(Resp):
         self.lines += ["data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": finish}]}), "", "data: [DONE]"]
 
     def iter_lines(self, decode_unicode=False):
-        return iter(self.lines)
+        # 模拟 requests 的真实行为：text/event-stream 没有 charset 时，decode_unicode 会按 Latin-1 解码
+        data = [line.encode("utf-8") for line in self.lines]
+        if decode_unicode:
+            return iter(b.decode("latin-1") for b in data)
+        return iter(data)
 
 
 def yahoo_payload(n=250, base=100):
@@ -230,6 +234,7 @@ def test_argon_failure_switches_to_kimi(env):
     assert "JSON Schema" in body["messages"][1]["content"]
     assert "🔴 <b>NVDA</b>" in calls["tg"][0]["text"]  # 备用模型的结果照常经过引用校验和渲染
     assert json.loads(redis.store["marcus_runs"])[0]["model"] == "kimi-k3.1-pro"
+    assert "美联储维持利率不变" in calls["tg"][0]["text"]  # 中文不能被解码成乱码
 
 
 def test_fallback_gets_remaining_budget(env, monkeypatch):
