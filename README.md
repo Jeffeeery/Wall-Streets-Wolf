@@ -42,7 +42,8 @@ Marcus is a **news/catalyst analyst** for short-term traders (1–5 trading days
 | `OPENCODE_MODEL`            | Optional primary model, defaults to `gemini-4-argon`; `gemini-*` models use the Google-native route, others the OpenAI-compatible route |
 | `OPENCODE_EFFORT`           | Optional, primary model's effort, defaults to `high` (Gemini `thinkingLevel` / OpenAI `reasoning_effort`); empty disables it |
 | `OPENCODE_FALLBACK_MODEL`   | Optional, defaults to `kimi-k3.1-pro`; empty disables the fallback |
-| `OPENCODE_FALLBACK_EFFORT`  | Optional, fallback model's effort, empty by default |
+| `OPENCODE_FALLBACK_EFFORT`  | Optional, fallback effort when ≥200s remain, default `medium` |
+| `OPENCODE_FALLBACK_RUSHED_EFFORT` | Optional, fallback effort when less time remains, default `low` |
 | `OPENCODE_GOOGLE_BASE_URL`  | Optional, defaults to `https://opencode.ai/inference/go/google/v1beta` (falls back to `/inference/go/v1` on 404) |
 | `OPENCODE_BASE_URL`         | Optional, OpenAI-compatible route, defaults to `https://opencode.ai/inference/go/openai/v1` |
 | `TAVILY_API_KEY`            | Tavily API key (news search) |

@@ -228,7 +228,7 @@ def test_argon_failure_switches_to_kimi(env):
 
     url, body, headers = calls["opencode"][1]
     assert url == "https://opencode.ai/inference/go/openai/v1/chat/completions"
-    assert body["model"] == "kimi-k3.1-pro" and "reasoning_effort" not in body
+    assert body["model"] == "kimi-k3.1-pro" and body["reasoning_effort"] == "medium"
     assert body["max_tokens"] == 32768 and body["stream"] is True
     assert headers["x-opencode-session"].startswith("marcus-")
     assert "JSON Schema" in body["messages"][1]["content"]
@@ -241,7 +241,7 @@ def test_fallback_gets_remaining_budget(env, monkeypatch):
     seen = []
 
     def fake_call(prompt, model, effort, timeout):
-        seen.append((model, timeout))
+        seen.append((model, effort, timeout))
         if model == main.OPENCODE_MODEL:
             raise main.LLMError("限流或上游不可用（429）")
         return BRIEF
@@ -251,13 +251,13 @@ def test_fallback_gets_remaining_budget(env, monkeypatch):
     monkeypatch.setattr(main.time, "monotonic", lambda: next(clock))
     brief, model = main.summarize("p")
     assert model == "kimi-k3.1-pro"
-    assert seen == [("gemini-4-argon", 150), ("kimi-k3.1-pro", 257)]  # 备用拿走剩下的 257s
+    assert seen == [("gemini-4-argon", "high", 150), ("kimi-k3.1-pro", "medium", 257)]  # 时间够：medium
 
     seen.clear()
     clock = iter([1000.0, 1150.0])  # 主模型拖满 150 秒才失败
     monkeypatch.setattr(main.time, "monotonic", lambda: next(clock))
     main.summarize("p")
-    assert seen[1] == ("kimi-k3.1-pro", 110)
+    assert seen[1] == ("kimi-k3.1-pro", "low", 110)  # 只剩 110s：降到 low
 
 
 def test_both_models_fail_quotes_provider_messages_and_keeps_memory(env):

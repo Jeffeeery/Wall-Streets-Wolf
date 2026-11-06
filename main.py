@@ -44,8 +44,11 @@ OPENCODE_API_KEY        = os.environ.get("OPENCODE_API_KEY", "")
 OPENCODE_MODEL          = os.environ.get("OPENCODE_MODEL", "gemini-4-argon")
 OPENCODE_EFFORT         = os.environ.get("OPENCODE_EFFORT", "high")
 OPENCODE_FALLBACK_MODEL = os.environ.get("OPENCODE_FALLBACK_MODEL", "kimi-k3.1-pro")
-# 不确定备用模型是否接受 reasoning_effort，默认不传，避免它因为参数不认识直接 400
-OPENCODE_FALLBACK_EFFORT = os.environ.get("OPENCODE_FALLBACK_EFFORT", "")
+# Kimi 的推理强度按剩余时间选（11-06 预览实测）：high 260s 内只想不写；medium 整轮 227s、质量好；low 整轮 103s。
+# 主模型秒挂时时间够用 medium；主模型拖到超时才挂，只剩约 110s，就降到 low 保证能出稿。
+OPENCODE_FALLBACK_EFFORT        = os.environ.get("OPENCODE_FALLBACK_EFFORT", "medium")
+OPENCODE_FALLBACK_RUSHED_EFFORT = os.environ.get("OPENCODE_FALLBACK_RUSHED_EFFORT", "low")
+FALLBACK_FULL_EFFORT_TIME       = 200   # 剩余时间低于这个秒数就用 RUSHED 强度
 OPENCODE_GOOGLE_BASES = [  # 官方文档地址在前；另一条是社区验证过可用的路径
     os.environ.get("OPENCODE_GOOGLE_BASE_URL", "https://opencode.ai/inference/go/google/v1beta"),
     "https://opencode.ai/inference/go/v1",
@@ -624,9 +627,10 @@ def summarize(user_prompt: str) -> tuple[dict, str]:
     if not OPENCODE_FALLBACK_MODEL:
         raise LLMError(f"{OPENCODE_MODEL} {primary_err}")
     fallback_timeout = max(MIN_FALLBACK_TIME, int(LLM_BUDGET - (time.monotonic() - started)))
+    effort = OPENCODE_FALLBACK_EFFORT if fallback_timeout >= FALLBACK_FULL_EFFORT_TIME else OPENCODE_FALLBACK_RUSHED_EFFORT
     try:
         return (
-            call_opencode(user_prompt, OPENCODE_FALLBACK_MODEL, OPENCODE_FALLBACK_EFFORT, fallback_timeout),
+            call_opencode(user_prompt, OPENCODE_FALLBACK_MODEL, effort, fallback_timeout),
             OPENCODE_FALLBACK_MODEL,
         )
     except LLMError as e:
