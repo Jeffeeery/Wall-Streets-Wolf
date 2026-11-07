@@ -210,7 +210,7 @@ def test_argon_request_shape(env):
     assert url2 == "https://opencode.ai/inference/go/v1/models/gemini-4-argon:generateContent"
     assert headers["Authorization"] == "Bearer oc-key"
     assert headers["x-opencode-session"].startswith("marcus-")  # 缺这个头会 400 MissingSessionID
-    assert body["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "high"}
+    assert body["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "medium"}
     assert body["generationConfig"]["maxOutputTokens"] == 32768  # 给思考 token 留足空间
     assert body["generationConfig"]["responseSchema"]  # Google 原生接口可用结构化输出
     run = json.loads(redis.store["marcus_runs"])[0]
@@ -251,7 +251,7 @@ def test_fallback_gets_remaining_budget(env, monkeypatch):
     monkeypatch.setattr(main.time, "monotonic", lambda: next(clock))
     brief, model = main.summarize("p")
     assert model == "kimi-k3.1-pro"
-    assert seen == [("gemini-4-argon", "high", 150), ("kimi-k3.1-pro", "medium", 257)]  # 时间够：medium
+    assert seen == [("gemini-4-argon", "medium", 150), ("kimi-k3.1-pro", "medium", 257)]  # 时间够：medium
 
     seen.clear()
     clock = iter([1000.0, 1150.0])  # 主模型拖满 150 秒才失败
