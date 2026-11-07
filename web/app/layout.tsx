@@ -11,6 +11,11 @@ export const metadata: Metadata = {
   description: "每天两次的市场消息面简报：要闻、各品种方向和未来事件",
   applicationName: "华尔街之狼",
   manifest: "/manifest.webmanifest",
+  // 固定路径：iPhone「添加到主屏幕」默认也会找 /apple-touch-icon.png，带哈希的地址偶尔取不到，会退回成名字首字
+  icons: {
+    icon: [{ url: "/icon.png", sizes: "64x64", type: "image/png" }],
+    apple: [{ url: "/apple-touch-icon.png", sizes: "180x180", type: "image/png" }],
+  },
   appleWebApp: { capable: true, title: "华尔街之狼", statusBarStyle: "default" },
 };
 
