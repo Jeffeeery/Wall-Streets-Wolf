@@ -42,7 +42,8 @@ YAHOO_SYMBOL_RE = re.compile(r"\^?[A-Z0-9][A-Z0-9.\-]{0,14}(=[FX])?")
 # 主备特意选不同厂商：之前主备都跑在 Google 上，Google 一出问题两个一起挂（11-05 20:30）。
 OPENCODE_API_KEY        = os.environ.get("OPENCODE_API_KEY", "")
 OPENCODE_MODEL          = os.environ.get("OPENCODE_MODEL", "gemini-4-argon")
-OPENCODE_EFFORT         = os.environ.get("OPENCODE_EFFORT", "high")
+# high 写不完：11-07 早上 cron 150s 超时；medium 预览实测整轮 46s
+OPENCODE_EFFORT         = os.environ.get("OPENCODE_EFFORT", "medium")
 OPENCODE_FALLBACK_MODEL = os.environ.get("OPENCODE_FALLBACK_MODEL", "kimi-k3.1-pro")
 # Kimi 的推理强度按剩余时间选（11-06 预览实测）：high 260s 内只想不写；medium 整轮 227s、质量好；low 整轮 103s。
 # 主模型秒挂时时间够用 medium；主模型拖到超时才挂，只剩约 110s，就降到 low 保证能出稿。
