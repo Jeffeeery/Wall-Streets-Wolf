@@ -27,6 +27,7 @@ TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 TG_TOKEN       = os.environ.get("TG_TOKEN")
 TG_CHAT_ID     = os.environ.get("TG_CHAT_ID")
 CRON_SECRET    = os.environ.get("CRON_SECRET", "")
+ADMIN_TOKEN    = os.environ.get("ADMIN_TOKEN", "")
 UPSTASH_URL    = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN  = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 SUPABASE_URL   = os.environ.get("SUPABASE_URL", "")
@@ -1005,7 +1006,14 @@ def get_watchlist():
 
 
 @app.post("/api/watchlist")
-def update_watchlist(body: WatchlistBody):
+def update_watchlist(body: WatchlistBody, authorization: str = Header(default="")):
+    # 改自选要带 Authorization: Bearer <ADMIN_TOKEN>；没配置 ADMIN_TOKEN 时一律拒绝写入，而不是放开
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="Watchlist writes disabled: ADMIN_TOKEN not configured")
+    token = authorization.removeprefix("Bearer ").strip()
+    # 转成 bytes 再比：compare_digest 遇到非 ASCII 的 str 会抛 TypeError
+    if not hmac.compare_digest(token.encode(), ADMIN_TOKEN.encode()):
+        raise HTTPException(status_code=401, detail="Unauthorized")
     if not body.symbols:
         raise HTTPException(status_code=422, detail="symbols list cannot be empty")
     clean = list(dict.fromkeys(s.upper().strip() for s in body.symbols[:20]))

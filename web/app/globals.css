@@ -124,6 +124,7 @@ table.dirs { width: 100%; border-collapse: collapse; }
 .addsym { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 14px; font-family: var(--sans); }
 .addsym input { flex: 1 1 240px; min-width: 0; font: 15px var(--sans); color: var(--ink); background: transparent; border: 0; border-bottom: 1px solid var(--ink); padding: 8px 0; outline: none; }
 .addsym input::placeholder { color: var(--faint); }
+.addsym input.tok { flex: 0 1 150px; }
 .addsym button { border: 1px solid var(--ink); background: var(--ink); color: var(--paper); font-size: 13px; padding: 8px 18px; }
 .addsym button:disabled { opacity: .35; }
 .addsym .hint { font-size: 11px; color: var(--faint); }

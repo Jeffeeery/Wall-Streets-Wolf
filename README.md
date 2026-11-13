@@ -50,6 +50,7 @@ Marcus is a **news/catalyst analyst** for short-term traders (1–5 trading days
 | `TG_TOKEN`                  | Telegram bot token                   |
 | `TG_CHAT_ID`                | Target Telegram chat/channel ID      |
 | `CRON_SECRET`               | Secret token to authenticate cron calls |
+| `ADMIN_TOKEN`               | Secret required to change the watchlist (`Authorization: Bearer <ADMIN_TOKEN>` on `POST /api/watchlist`). While unset, watchlist writes are refused with 503 |
 | `UPSTASH_REDIS_REST_URL`    | Upstash Redis REST endpoint          |
 | `UPSTASH_REDIS_REST_TOKEN`  | Upstash Redis REST token             |
 | `SUPABASE_URL`              | Supabase project URL (optional, history archive) |
@@ -59,6 +60,7 @@ Marcus is a **news/catalyst analyst** for short-term traders (1–5 trading days
 
 1. Fork/clone this repo and import it into Vercel.
 2. Set all environment variables above in the Vercel project settings.
+   `ADMIN_TOKEN` must be set **before** deploying a version that checks it; otherwise the dashboard can no longer edit the watchlist (the server answers 503 until the variable exists). Use a long random value, e.g. `openssl rand -hex 32`. The dashboard asks for it the first time you add or remove a symbol and keeps it in the browser's `sessionStorage` only.
 3. Vercel picks up `vercel.json` automatically — no extra configuration needed.
 4. `vercel.json` schedules **two runs a day** via Vercel Cron: 23:00 UTC (07:00 Kuala Lumpur, after the US close) and 12:00 UTC (20:00 Kuala Lumpur, before the US open). Vercel sends `Authorization: Bearer <CRON_SECRET>` automatically. If you used an external scheduler before, disable it to avoid duplicate runs; it can still call:
    ```
@@ -92,6 +94,8 @@ GET http://localhost:8000/api/trigger-analysis?secret=<CRON_SECRET>
 | `GET`  | `/`                         | Health check — returns model/version info |
 | `GET`  | `/api/trigger-analysis`     | Runs full pipeline (requires `secret` query param) |
 | `GET`  | `/api/memory`               | Latest brief (full report + sources) |
+| `GET`  | `/api/watchlist`            | Current watchlist (public) |
+| `POST` | `/api/watchlist`            | Replace the watchlist (requires `Authorization: Bearer <ADMIN_TOKEN>`; 401 on a wrong token, 503 while `ADMIN_TOKEN` is unset) |
 | `GET`  | `/api/runs`                 | Last 30 runs: cron/manual, success, model, failure reason, duration |
 | `GET`  | `/api/history`              | Archived runs from Supabase |
 
