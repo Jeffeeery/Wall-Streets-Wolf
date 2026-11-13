@@ -356,7 +356,8 @@ def test_watchlist_validation(monkeypatch):
     from fastapi.testclient import TestClient
     redis = FakeRedis()
     monkeypatch.setattr(main, "get_redis", lambda: redis)
-    client = TestClient(main.app)
+    monkeypatch.setattr(main, "ADMIN_TOKEN", "adm1n")
+    client = TestClient(main.app, headers={"Authorization": "Bearer adm1n"})
 
     ok = client.post("/api/watchlist", json={"symbols": ["nvda", "^GSPC", "CL=F", "BTC-USD", "0700.HK", "EURUSD=X", "NVDA"]})
     assert ok.status_code == 200
@@ -366,6 +367,31 @@ def test_watchlist_validation(monkeypatch):
         r = client.post("/api/watchlist", json={"symbols": ["NVDA", bad]})
         assert r.status_code == 422, bad
     assert json.loads(redis.store["marcus_watchlist"])[0] == "NVDA"
+
+
+def test_watchlist_write_needs_admin_token(monkeypatch):
+    from fastapi.testclient import TestClient
+    redis = FakeRedis()
+    monkeypatch.setattr(main, "get_redis", lambda: redis)
+    client = TestClient(main.app)
+    body = {"symbols": ["NVDA"]}
+
+    # 未配置 ADMIN_TOKEN：拒绝写入（503），带不带 token 都一样；读取仍然公开
+    monkeypatch.setattr(main, "ADMIN_TOKEN", "")
+    assert client.post("/api/watchlist", json=body).status_code == 503
+    assert client.post("/api/watchlist", json=body, headers={"Authorization": "Bearer "}).status_code == 503
+    assert client.get("/api/watchlist").json() == {"watchlist": main.WATCHLIST}
+
+    monkeypatch.setattr(main, "ADMIN_TOKEN", "adm1n")
+    assert client.post("/api/watchlist", json=body).status_code == 401  # 没带 token
+    assert client.post("/api/watchlist", json=body, headers={"Authorization": "Bearer bad"}).status_code == 401
+    assert client.post("/api/watchlist", json=body, headers={"Authorization": "Bearer 错的".encode()}).status_code == 401
+    assert "marcus_watchlist" not in redis.store
+
+    ok = client.post("/api/watchlist", json=body, headers={"Authorization": "Bearer adm1n"})
+    assert ok.status_code == 200 and ok.json() == {"watchlist": ["NVDA"], "saved": True}
+    assert json.loads(redis.store["marcus_watchlist"]) == ["NVDA"]
+    assert client.get("/api/watchlist").json() == {"watchlist": ["NVDA"]}  # 读取不需要 token
 
 
 def test_chart_timeframes(monkeypatch):

@@ -27,14 +27,21 @@ export const fetchWatchlist = () => get<WatchlistResponse>("/api/watchlist");
 export const fetchHistory = (limit = 30) =>
   get<HistoryResponse>(`/api/history?limit=${limit}`);
 
-export async function saveWatchlist(symbols: string[]): Promise<void> {
+/** 带 HTTP 状态码的错误，界面按状态码给出对应提示 */
+export class ApiError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+export async function saveWatchlist(symbols: string[], token: string): Promise<void> {
   const res = await fetch(`${BASE}/api/watchlist`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify({ symbols }),
   });
   if (!res.ok) {
     const body = await res.json().catch(() => null);
-    throw new Error(body?.detail ?? "Failed to save watchlist");
+    throw new ApiError(res.status, body?.detail ?? "Failed to save watchlist");
   }
 }

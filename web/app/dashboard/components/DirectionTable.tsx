@@ -1,13 +1,15 @@
 "use client";
 import { useState } from "react";
 import useSWR from "swr";
-import { fetchChartData, fetchWatchlist, saveWatchlist } from "@/lib/api";
+import { ApiError, fetchChartData, fetchWatchlist, saveWatchlist } from "@/lib/api";
 import type { MarketSnapshot, OutlookItem } from "@/lib/types";
 import { DIR_GLYPH, dirTone, numTone, shortName } from "@/lib/brief";
 import { DIRECTION_LABEL, formatPct, formatPrice } from "@/lib/format";
 import { Dots } from "./Lead";
 
 const chartOpts = { revalidateOnFocus: false, dedupingInterval: 600_000 };
+/** 管理口令只放在 sessionStorage：关掉标签页就没了，不进打包产物 */
+const TOKEN_KEY = "marcus_admin_token";
 
 /** 近 30 根收盘价的走势线 */
 function Spark({ symbol }: { symbol: string }) {
@@ -54,16 +56,36 @@ export default function DirectionTable({
   const [input, setInput] = useState("");
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [token, setToken] = useState("");
+  const [askToken, setAskToken] = useState(true);
 
   const save = async (next: string[]) => {
+    const tok = token.trim();
+    if (!tok) {
+      setMessage("请先填写管理口令");
+      return false;
+    }
     setSaving(true);
     setMessage(null);
     try {
-      await saveWatchlist(next);
+      await saveWatchlist(next, tok);
+      sessionStorage.setItem(TOKEN_KEY, tok);
+      setAskToken(false);
       await mutate();
       return true;
     } catch (e) {
-      setMessage(e instanceof Error ? e.message : "保存失败，请稍后再试");
+      const status = e instanceof ApiError ? e.status : 0;
+      if (status === 401) {
+        // 口令不对：清掉已记住的，让输入框重新出现
+        sessionStorage.removeItem(TOKEN_KEY);
+        setToken("");
+        setAskToken(true);
+        setMessage("管理口令不对，请重新输入");
+      } else if (status === 503 && e instanceof Error && e.message.includes("ADMIN_TOKEN")) {
+        setMessage("服务器还没有配置 ADMIN_TOKEN，暂时不能修改自选");
+      } else {
+        setMessage(e instanceof Error ? e.message : "保存失败，请稍后再试");
+      }
       return false;
     } finally {
       setSaving(false);
@@ -90,6 +112,11 @@ export default function DirectionTable({
             type="button"
             className="link"
             onClick={() => {
+              if (!editing) {
+                const saved = sessionStorage.getItem(TOKEN_KEY) ?? "";
+                setToken(saved);
+                setAskToken(!saved);
+              }
               setEditing((v) => !v);
               setMessage(null);
             }}
@@ -173,10 +200,23 @@ export default function DirectionTable({
             autoCapitalize="characters"
             autoCorrect="off"
           />
+          {askToken && (
+            <input
+              className="tok"
+              type="password"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder="管理口令"
+              aria-label="管理口令"
+              autoComplete="off"
+            />
+          )}
           <button type="submit" disabled={saving || !input.trim()}>
             添加
           </button>
-          <span className="hint">改动会在下一期简报生效</span>
+          <span className="hint">
+            {askToken ? "添加或移除都需要管理口令，只在本次会话记住 · " : ""}改动会在下一期简报生效
+          </span>
         </form>
       )}
       {message && <p className="err">{message}</p>}
