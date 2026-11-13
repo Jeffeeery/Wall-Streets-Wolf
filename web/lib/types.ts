@@ -108,3 +108,21 @@ export interface HistoryRecord {
 export interface HistoryResponse {
   history: HistoryRecord[];
 }
+
+/** 一组方向判断的事后命中情况；样本不足时 hit_rate 为 null */
+export interface HitBucket {
+  hits: number;
+  total: number;
+  hit_rate: number | null;
+  insufficient: boolean;
+}
+
+export interface HitRateStats {
+  days: number;
+  min_sample: number;
+  open: number;
+  skipped: number;
+  overall: HitBucket;
+  by_confidence: Record<Level, HitBucket>;
+  by_symbol: Record<string, HitBucket>;
+}

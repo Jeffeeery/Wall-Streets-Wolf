@@ -94,6 +94,23 @@ GET http://localhost:8000/api/trigger-analysis?secret=<CRON_SECRET>
 | `GET`  | `/api/memory`               | Latest brief (full report + sources) |
 | `GET`  | `/api/runs`                 | Last 30 runs: cron/manual, success, model, failure reason, duration |
 | `GET`  | `/api/history`              | Archived runs from Supabase |
+| `GET`  | `/api/stats/hit-rate`       | How often past bullish/bearish calls turned out right: overall, by confidence, by symbol, each with its sample size (`?days=1..5`, default 3) |
+
+## Direction Scoring
+
+Marcus only gives a direction, so the check is equally simple: did the price go that way? `GET /api/stats/hit-rate` computes this on every request from the Supabase archive plus Yahoo daily bars. Nothing is stored, and neither Tavily nor the model is called.
+
+- **What is scored** — every `BULLISH` / `BEARISH` call in an archived run. `NEUTRAL` calls are not scored. Runs from before v3 have no `outlook` and are ignored. Confidence is read from `brief.outlook`, because the `outlook` column stores the direction only.
+- **Reference price** — the symbol's price in that run's own `snapshot`.
+- **Outcome** — the close of the Nth daily bar that opens after the run (N = `days`, default 3). For US stocks this is a plain close-to-close return over N sessions: the 07:00 run starts from that day's close, the 20:00 run from the previous close.
+- **Hit** — bullish and the outcome is above the reference, or bearish and below. Unchanged counts as a miss.
+- **Open** — a call whose Nth bar has not closed yet is counted as `open` and left out. A bar counts as closed 24 hours after it opens, since Yahoo's bar for the current session carries the live price.
+- **Skipped** — the run had no price for the symbol, or Yahoo returned no bars.
+- **Small samples** — a bucket with fewer than 10 scored calls returns its counts with `hit_rate: null` and `insufficient: true` instead of a percentage.
+
+Why 3 days: the brief's horizon is 1–5 trading days. One day is mostly noise, and five days leaves the latest week permanently unscored; three is the middle.
+
+Read the numbers with care. Marcus often repeats the same call twice a day for several days, and each repeat is scored as its own sample, so a single wrong or right view of one market move can account for a dozen "samples". The symbol is scored on its own price, including `^VIX`, where bullish means the index rose.
 
 ## Report Structure
 

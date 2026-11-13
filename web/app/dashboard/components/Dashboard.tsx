@@ -5,6 +5,7 @@ import { fetchMemory, fetchSnapshot, fetchWatchlist } from "@/lib/api";
 import Almanac from "./Almanac";
 import ChartSection from "./ChartSection";
 import DirectionTable from "./DirectionTable";
+import HitRate from "./HitRate";
 import Lead from "./Lead";
 import Masthead from "./Masthead";
 import NewsSection from "./NewsSection";
@@ -40,6 +41,7 @@ export default function Dashboard() {
 
       <DirectionTable outlook={brief?.outlook ?? []} market={market} selected={selected} onSelect={setPicked} />
       <ChartSection symbols={symbols} selected={selected} onSelect={setPicked} market={market} />
+      <HitRate />
       <Almanac brief={brief} symbols={symbols} latestTime={memory?.time} />
 
       {memory?.sources && memory.sources.length > 0 && (

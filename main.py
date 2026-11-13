@@ -116,7 +116,7 @@ def sb_insert(row: dict) -> None:
     except Exception:
         log.error("Supabase insert error:\n%s", tb.format_exc())
 
-def sb_fetch_history(limit: int = 30) -> list:
+def sb_fetch_history(limit: int = 30, select: str = "*") -> list:
     """Fetch latest N rows from analysis_history."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         return []
@@ -124,7 +124,7 @@ def sb_fetch_history(limit: int = 30) -> list:
         res = requests.get(
             f"{SUPABASE_URL}/rest/v1/analysis_history",
             headers={**_SB_HEADERS, "Prefer": ""},
-            params={"order": "created_at.desc", "limit": limit},
+            params={"select": select, "order": "created_at.desc", "limit": limit},
             timeout=10,
         )
         if res.status_code == 200:
@@ -277,6 +277,26 @@ class QuantDataEngine:
                 log.warning("[QuantDataEngine] 跳过 %s: %s", sym, e)
 
         return market_state
+
+    @staticmethod
+    def fetch_daily_closes(sym: str) -> list[tuple[int, float]]:
+        """近一年日线的 (时间戳, 收盘价)，用来事后核对方向判断；拉取失败返回空列表。"""
+        try:
+            url = (
+                f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}"
+                f"?range=1y&interval=1d"
+            )
+            res = requests.get(
+                url,
+                headers=QuantDataEngine.HEADERS,
+                timeout=QuantDataEngine.REQUEST_TIMEOUT,
+            ).json()
+            result = res["chart"]["result"][0]
+            closes = result["indicators"]["quote"][0].get("close", [])
+            return [(ts, c) for ts, c in zip(result.get("timestamp") or [], closes) if c is not None]
+        except Exception as e:
+            log.warning("[QuantDataEngine] 日线拉取失败 %s: %s", sym, e)
+            return []
 
 
 # ==========================================
@@ -979,6 +999,84 @@ class MarcusAgent:
 
 
 # ==========================================
+# 方向命中率：读历史记录按需计算，不落库，不调用 Tavily / 模型
+# ==========================================
+# 简报的口径是 1-5 个交易日，默认取中间的 3 天：1 天基本是噪音，
+# 5 天要多等一周才有结果、样本也更少
+HIT_RATE_DAYS       = 3
+HIT_RATE_MIN_SAMPLE = 10    # 样本少于这个数只给次数，不给百分比
+HIT_RATE_HISTORY    = 200   # 每天两期，约 100 天
+# 置信度只存在 brief.outlook 里（outlook 列只有方向），用 PostgREST 只取这一段，不拉整份简报
+HIT_RATE_SELECT     = "analysis_time,snapshot,outlook,brief_outlook:brief->outlook"
+
+
+def run_calls(row: dict) -> list[tuple[str, str, str | None]]:
+    """一条历史记录里的 (品种, 方向, 置信度)。v3 之前的记录没有 outlook，返回空列表。"""
+    detailed = row.get("brief_outlook")
+    if isinstance(detailed, list):
+        return [(o.get("symbol"), o.get("direction"), o.get("confidence"))
+                for o in detailed if isinstance(o, dict)]
+    return [(sym, direction, None) for sym, direction in (row.get("outlook") or {}).items()]
+
+
+def _hit_bucket(hits: int, total: int) -> dict:
+    enough = total >= HIT_RATE_MIN_SAMPLE
+    return {
+        "hits":         hits,
+        "total":        total,
+        "hit_rate":     round(hits / total * 100, 1) if enough else None,
+        "insufficient": not enough,
+    }
+
+
+def score_direction_calls(rows: list[dict], bars: dict[str, list], days: int, now_ts: float) -> dict:
+    """
+    用事后的日线给每条利好/利空判断打分：以当期 snapshot 的价格为基准，
+    看运行之后开盘的第 days 根日线的收盘价，利好要涨、利空要跌才算命中（持平算没中）。
+    中性不计分；第 days 根日线还没收盘的算 open；当期没有价格或拉不到日线的算 skipped。
+    bars: {品种: [(时间戳, 收盘价), ...]}，按时间升序。
+    """
+    tz = pytz.timezone(TIMEZONE)
+    overall, by_conf, by_sym = [0, 0], {c: [0, 0] for c in CONFIDENCE_CN}, {}
+    still_open = skipped = 0
+
+    for row in rows:
+        try:
+            run_ts = tz.localize(datetime.strptime(row["analysis_time"], "%Y-%m-%d %H:%M")).timestamp()
+        except (KeyError, TypeError, ValueError):
+            continue
+        snapshot = row.get("snapshot") or {}
+        for sym, direction, confidence in run_calls(row):
+            if direction not in ("BULLISH", "BEARISH"):
+                continue
+            ref, series = snapshot.get(sym), bars.get(sym)
+            if not ref or not series:
+                skipped += 1
+                continue
+            # Yahoo 日线的时间戳是开盘时间，盘中那根的 close 是现价：开盘满 24 小时才当作已收盘
+            after = [c for ts, c in series if run_ts < ts <= now_ts - 86400]
+            if len(after) < days:
+                still_open += 1
+                continue
+            move = after[days - 1] - ref
+            hit  = move > 0 if direction == "BULLISH" else move < 0
+            for bucket in (overall, by_conf.get(confidence), by_sym.setdefault(sym, [0, 0])):
+                if bucket is not None:
+                    bucket[0] += hit
+                    bucket[1] += 1
+
+    return {
+        "days":          days,
+        "min_sample":    HIT_RATE_MIN_SAMPLE,
+        "open":          still_open,
+        "skipped":       skipped,
+        "overall":       _hit_bucket(*overall),
+        "by_confidence": {c: _hit_bucket(*b) for c, b in by_conf.items()},
+        "by_symbol":     {s: _hit_bucket(*b) for s, b in by_sym.items()},
+    }
+
+
+# ==========================================
 # 5. API 路由
 # ==========================================
 class WatchlistBody(BaseModel):
@@ -1111,6 +1209,26 @@ def get_history(limit: int = 30):
     except Exception:
         log.error("get_history 异常:\n%s", tb.format_exc())
         raise HTTPException(status_code=503, detail="History unavailable")
+
+
+@app.get("/api/stats/hit-rate")
+def get_hit_rate(days: int = HIT_RATE_DAYS):
+    """各品种方向判断的事后命中率：总体、按置信度、按品种，都带样本数。"""
+    if not 1 <= days <= 5:
+        raise HTTPException(status_code=422, detail="days must be between 1 and 5")
+    try:
+        rows = sb_fetch_history(HIT_RATE_HISTORY, HIT_RATE_SELECT)
+        symbols = sorted({
+            sym for row in rows for sym, direction, _ in run_calls(row)
+            if direction in ("BULLISH", "BEARISH")
+        })
+        # 每个品种只拉一次日线，并行拉，避免品种多时超出函数时限
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            bars = dict(zip(symbols, pool.map(QuantDataEngine.fetch_daily_closes, symbols)))
+        return score_direction_calls(rows, bars, days, time.time())
+    except Exception:
+        log.error("get_hit_rate 异常:\n%s", tb.format_exc())
+        raise HTTPException(status_code=503, detail="Hit rate unavailable")
 
 
 @app.get("/")
